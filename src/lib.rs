@@ -478,26 +478,50 @@ fn entity_has(world: &World, entity: Entity, mask: u64) -> bool {
             .is_some_and(|location| world.tables[location.table].mask & mask == mask)
 }
 
-fn get_local_transform(world: &World, entity: Entity) -> Option<LocalTransform> {
+fn component<T>(
+    world: &World,
+    entity: Entity,
+    bit: u64,
+    read: impl FnOnce(&Table, usize) -> T,
+) -> Option<T> {
     let location = get_location(world, entity)?;
     let table = &world.tables[location.table];
-    (table.mask & LOCAL_TRANSFORM != 0).then(|| table.local_transforms[location.row].0)
+    (table.mask & bit != 0).then(|| read(table, location.row))
 }
 
-fn get_local_transform_mut(world: &mut World, entity: Entity) -> Option<&mut LocalTransform> {
+fn component_mut<'world, T>(
+    world: &'world mut World,
+    entity: Entity,
+    bit: u64,
+    read: impl FnOnce(&'world mut Table, usize, u32) -> &'world mut T,
+) -> Option<&'world mut T> {
     let location = get_location(world, entity)?;
     let tick = world.current_tick;
     let table = &mut world.tables[location.table];
-    (table.mask & LOCAL_TRANSFORM != 0).then(|| {
-        table.local_transforms[location.row].1 = tick;
-        &mut table.local_transforms[location.row].0
+    if table.mask & bit != 0 {
+        Some(read(table, location.row, tick))
+    } else {
+        None
+    }
+}
+
+fn get_local_transform(world: &World, entity: Entity) -> Option<LocalTransform> {
+    component(world, entity, LOCAL_TRANSFORM, |table, row| {
+        table.local_transforms[row].0
+    })
+}
+
+fn get_local_transform_mut(world: &mut World, entity: Entity) -> Option<&mut LocalTransform> {
+    component_mut(world, entity, LOCAL_TRANSFORM, |table, row, tick| {
+        table.local_transforms[row].1 = tick;
+        &mut table.local_transforms[row].0
     })
 }
 
 fn get_global_transform(world: &World, entity: Entity) -> Option<GlobalTransform> {
-    let location = get_location(world, entity)?;
-    let table = &world.tables[location.table];
-    (table.mask & GLOBAL_TRANSFORM != 0).then(|| table.global_transforms[location.row].0)
+    component(world, entity, GLOBAL_TRANSFORM, |table, row| {
+        table.global_transforms[row].0
+    })
 }
 
 fn set_global_transform(world: &mut World, entity: Entity, value: GlobalTransform) {
@@ -512,34 +536,24 @@ fn set_global_transform(world: &mut World, entity: Entity, value: GlobalTransfor
 }
 
 fn get_parent(world: &World, entity: Entity) -> Option<Parent> {
-    let location = get_location(world, entity)?;
-    let table = &world.tables[location.table];
-    (table.mask & PARENT != 0).then(|| table.parents[location.row].0)
+    component(world, entity, PARENT, |table, row| table.parents[row].0)
 }
 
 fn get_camera(world: &World, entity: Entity) -> Option<Camera> {
-    let location = get_location(world, entity)?;
-    let table = &world.tables[location.table];
-    (table.mask & CAMERA != 0).then(|| table.cameras[location.row].0)
+    component(world, entity, CAMERA, |table, row| table.cameras[row].0)
 }
 
 fn get_pan_orbit_camera_mut(world: &mut World, entity: Entity) -> Option<&mut PanOrbitCamera> {
-    let location = get_location(world, entity)?;
-    let tick = world.current_tick;
-    let table = &mut world.tables[location.table];
-    (table.mask & PAN_ORBIT_CAMERA != 0).then(|| {
-        table.pan_orbit_cameras[location.row].1 = tick;
-        &mut table.pan_orbit_cameras[location.row].0
+    component_mut(world, entity, PAN_ORBIT_CAMERA, |table, row, tick| {
+        table.pan_orbit_cameras[row].1 = tick;
+        &mut table.pan_orbit_cameras[row].0
     })
 }
 
 fn get_emissive_mut(world: &mut World, entity: Entity) -> Option<&mut Emissive> {
-    let location = get_location(world, entity)?;
-    let tick = world.current_tick;
-    let table = &mut world.tables[location.table];
-    (table.mask & EMISSIVE != 0).then(|| {
-        table.emissives[location.row].1 = tick;
-        &mut table.emissives[location.row].0
+    component_mut(world, entity, EMISSIVE, |table, row, tick| {
+        table.emissives[row].1 = tick;
+        &mut table.emissives[row].0
     })
 }
 
@@ -1403,6 +1417,30 @@ fn depth_attachment<'a>(
     (view, load, store_op(context, resource))
 }
 
+fn fullscreen_pass(
+    context: &mut PassContext,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    output: &str,
+) {
+    let (view, load, store) = color_attachment(context, output);
+    let mut pass = context
+        .encoder
+        .begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations { load, store },
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..3, 0..1);
+}
+
 fn render_graph_execute(
     graph: &mut RenderGraph,
     device: &wgpu::Device,
@@ -1626,25 +1664,7 @@ impl PassNode for BrightPass {
                 ],
             });
 
-        let (color_view, color_load, color_store) = color_attachment(context, "bright");
-        let mut pass = context
-            .encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: color_load,
-                        store: color_store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        fullscreen_pass(context, &self.pipeline, &bind_group, "bright");
     }
 }
 
@@ -1687,25 +1707,7 @@ impl PassNode for BlurPass {
                 ],
             });
 
-        let (color_view, color_load, color_store) = color_attachment(context, "output");
-        let mut pass = context
-            .encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: color_load,
-                        store: color_store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        fullscreen_pass(context, &self.pipeline, &bind_group, "output");
     }
 }
 
@@ -1748,25 +1750,7 @@ impl PassNode for CompositePass {
                 ],
             });
 
-        let (color_view, color_load, color_store) = color_attachment(context, "color");
-        let mut pass = context
-            .encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: color_load,
-                        store: color_store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        fullscreen_pass(context, &self.pipeline, &bind_group, "color");
     }
 }
 
