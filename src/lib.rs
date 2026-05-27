@@ -42,20 +42,9 @@ impl Default for LocalTransform {
 }
 
 fn local_transform_matrix(transform: &LocalTransform) -> Mat4 {
-    let mut matrix = nalgebra_glm::quat_to_mat4(&transform.rotation.normalize());
-    matrix[(0, 0)] *= transform.scale.x;
-    matrix[(1, 0)] *= transform.scale.x;
-    matrix[(2, 0)] *= transform.scale.x;
-    matrix[(0, 1)] *= transform.scale.y;
-    matrix[(1, 1)] *= transform.scale.y;
-    matrix[(2, 1)] *= transform.scale.y;
-    matrix[(0, 2)] *= transform.scale.z;
-    matrix[(1, 2)] *= transform.scale.z;
-    matrix[(2, 2)] *= transform.scale.z;
-    matrix[(0, 3)] = transform.translation.x;
-    matrix[(1, 3)] = transform.translation.y;
-    matrix[(2, 3)] = transform.translation.z;
-    matrix
+    nalgebra_glm::translation(&transform.translation)
+        * nalgebra_glm::quat_to_mat4(&transform.rotation.normalize())
+        * nalgebra_glm::scaling(&transform.scale)
 }
 
 #[derive(Clone, Copy)]
@@ -105,44 +94,28 @@ impl Default for PerspectiveCamera {
 fn perspective_matrix(camera: &PerspectiveCamera, aspect_ratio: f32) -> Mat4 {
     let focal = 1.0 / (camera.y_fov_radians / 2.0).tan();
     let z_near = camera.z_near;
-    match camera.z_far {
-        Some(z_far) => Mat4::new(
-            focal / aspect_ratio,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            focal,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            z_near / (z_far - z_near),
-            z_near * z_far / (z_far - z_near),
-            0.0,
-            0.0,
-            -1.0,
-            0.0,
-        ),
-        None => Mat4::new(
-            focal / aspect_ratio,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            focal,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            z_near,
-            0.0,
-            0.0,
-            -1.0,
-            0.0,
-        ),
-    }
+    let (depth_scale, depth_bias) = match camera.z_far {
+        Some(z_far) => (z_near / (z_far - z_near), z_near * z_far / (z_far - z_near)),
+        None => (0.0, z_near),
+    };
+    Mat4::new(
+        focal / aspect_ratio,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        focal,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        depth_scale,
+        depth_bias,
+        0.0,
+        0.0,
+        -1.0,
+        0.0,
+    )
 }
 
 #[derive(Clone, Copy, Default)]
@@ -880,19 +853,29 @@ fn initialize_world(world: &mut World) {
     }
 }
 
-const TRIANGLE_VERTICES: [([f32; 3], [f32; 3]); 3] = [
-    ([1., -1., 0.], [1., 0., 0.]),
-    ([-1., -1., 0.], [0., 1., 0.]),
-    ([0., 1., 0.], [0., 0., 1.]),
+const TRIANGLE_VERTICES: [f32; 18] = [
+    1., -1., 0., 1., 0., 0., -1., -1., 0., 0., 1., 0., 0., 1., 0., 0., 0., 1.,
 ];
 
 const SHADER: &str = "
+@group(0) @binding(0) var<uniform> view_projection: mat4x4<f32>;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec3<f32>,
+    @location(2) model_0: vec4<f32>,
+    @location(3) model_1: vec4<f32>,
+    @location(4) model_2: vec4<f32>,
+    @location(5) model_3: vec4<f32>,
+}
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
 }
-@vertex fn vs(@location(0) position: vec4<f32>, @location(1) color: vec4<f32>) -> VertexOutput {
-    return VertexOutput(position, color);
+@vertex fn vs(in: VertexInput) -> VertexOutput {
+    let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
+    let clip = view_projection * model * vec4<f32>(in.position, 1.0);
+    return VertexOutput(clip, vec4<f32>(in.color, 1.0));
 }
 @fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
     return in.color;
@@ -929,41 +912,43 @@ fn render_graph_execute(graph: &mut RenderGraph, context: &mut PassContext) {
 struct TrianglePass {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
-    capacity_vertices: u32,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: u32,
+    view_projection_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 impl PassNode for TrianglePass {
     fn execute(&mut self, context: &mut PassContext) {
         let view_projection = view_projection_matrix(context.world, context.aspect_ratio)
             .unwrap_or_else(Mat4::identity);
+        context.queue.write_buffer(
+            &self.view_projection_buffer,
+            0,
+            bytemuck::cast_slice(view_projection.as_slice()),
+        );
+
         let models = renderable_models(context.world);
-
-        let mut vertex_data: Vec<f32> = Vec::with_capacity(models.len() * 24);
-        for model in &models {
-            let model_view_projection = view_projection * model;
-            for (position, color) in TRIANGLE_VERTICES.iter() {
-                let clip = model_view_projection
-                    * nalgebra_glm::vec4(position[0], position[1], position[2], 1.0);
-                vertex_data.extend_from_slice(&[
-                    clip.x, clip.y, clip.z, clip.w, color[0], color[1], color[2], 1.0,
-                ]);
-            }
-        }
-
-        let vertex_count = (vertex_data.len() / 8) as u32;
-        if vertex_count > self.capacity_vertices {
-            self.capacity_vertices = vertex_count.next_power_of_two();
-            self.vertex_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+        let instance_count = models.len() as u32;
+        if instance_count > self.instance_capacity {
+            self.instance_capacity = instance_count.next_power_of_two();
+            self.instance_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: self.capacity_vertices as u64 * 32,
+                size: self.instance_capacity as u64 * 64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
         }
-        if vertex_count > 0 {
-            context
-                .queue
-                .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertex_data));
+        if instance_count > 0 {
+            let mut instance_data: Vec<f32> = Vec::with_capacity(models.len() * 16);
+            for model in &models {
+                instance_data.extend_from_slice(model.as_slice());
+            }
+            context.queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&instance_data),
+            );
         }
 
         let mut pass = context
@@ -993,10 +978,12 @@ impl PassNode for TrianglePass {
                 }),
                 ..Default::default()
             });
-        if vertex_count > 0 {
+        if instance_count > 0 {
             pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.draw(0..vertex_count, 0..1);
+            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            pass.draw(0..3, 0..instance_count);
         }
     }
 }
@@ -1077,7 +1064,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         label: None,
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
     });
-    let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+    let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+    let instance_attrs =
+        wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4];
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
         layout: None,
@@ -1085,11 +1074,18 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             module: &shader,
             entry_point: Some("vs"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: 32,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &vertex_attrs,
-            }],
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: 24,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &vertex_attrs,
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: 64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &instance_attrs,
+                },
+            ],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
@@ -1112,9 +1108,32 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
 
     let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 96,
+        size: std::mem::size_of_val(&TRIANGLE_VERTICES) as u64,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
+    });
+    queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&TRIANGLE_VERTICES));
+
+    let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let view_projection_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: view_projection_buffer.as_entire_binding(),
+        }],
     });
 
     let depth_view = create_depth_view(&device, width, height);
@@ -1141,7 +1160,10 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         passes: vec![Box::new(TrianglePass {
             pipeline,
             vertex_buffer,
-            capacity_vertices: 3,
+            instance_buffer,
+            instance_capacity: 1,
+            view_projection_buffer,
+            bind_group,
         })],
     };
 
