@@ -184,18 +184,16 @@ fn pan_orbit_position_rotation(focus: Vec3, yaw: f32, pitch: f32, radius: f32) -
     (position, rotation)
 }
 
-const LOCAL_TRANSFORM: u64 = 1;
-const GLOBAL_TRANSFORM: u64 = 2;
-const PARENT: u64 = 4;
-const LOCAL_TRANSFORM_DIRTY: u64 = 8;
-const CAMERA: u64 = 16;
-const PAN_ORBIT_CAMERA: u64 = 32;
-const MESH: u64 = 64;
-const EMISSIVE: u64 = 128;
-
 macro_rules! components {
-    ($($name:ty, $field:ident, $bit:expr);* $(;)?) => {
-        const COMPONENT_COUNT: usize = [$($bit),*].len();
+    (@bits $index:expr,) => {};
+    (@bits $index:expr, $constant:ident $($rest:ident)*) => {
+        const $constant: u64 = 1u64 << $index;
+        components!(@bits $index + 1, $($rest)*);
+    };
+    ($($constant:ident => $name:ty, $field:ident);* $(;)?) => {
+        components!(@bits 0u64, $($constant)*);
+
+        const COMPONENT_COUNT: usize = [$($constant),*].len();
 
         #[derive(Default)]
         struct Table {
@@ -211,7 +209,7 @@ macro_rules! components {
         fn table_push(table: &mut Table, entity: Entity, tick: u32) -> usize {
             let row = table.entities.len();
             table.entities.push(entity);
-            $(if table.mask & $bit != 0 { table.$field.push((Default::default(), tick)); })*
+            $(if table.mask & $constant != 0 { table.$field.push((Default::default(), tick)); })*
             row
         }
 
@@ -219,15 +217,15 @@ macro_rules! components {
             let last = table.entities.len().saturating_sub(1);
             let moved = if row < last { Some(table.entities[last]) } else { None };
             table.entities.swap_remove(row);
-            $(if table.mask & $bit != 0 { table.$field.swap_remove(row); })*
+            $(if table.mask & $constant != 0 { table.$field.swap_remove(row); })*
             moved
         }
 
         fn table_move_row(source: &mut Table, row: usize, destination: &mut Table, tick: u32) -> (usize, Option<Entity>) {
             destination.entities.push(source.entities[row]);
-            $(if destination.mask & $bit != 0 {
+            $(if destination.mask & $constant != 0 {
                 destination.$field.push(
-                    if source.mask & $bit != 0 { std::mem::take(&mut source.$field[row]) }
+                    if source.mask & $constant != 0 { std::mem::take(&mut source.$field[row]) }
                     else { (Default::default(), tick) }
                 );
             })*
@@ -238,14 +236,14 @@ macro_rules! components {
 }
 
 components!(
-    LocalTransform,      local_transforms,      LOCAL_TRANSFORM;
-    GlobalTransform,     global_transforms,     GLOBAL_TRANSFORM;
-    Parent,              parents,               PARENT;
-    LocalTransformDirty, local_transform_dirty, LOCAL_TRANSFORM_DIRTY;
-    Camera,              cameras,               CAMERA;
-    PanOrbitCamera,      pan_orbit_cameras,     PAN_ORBIT_CAMERA;
-    Mesh,                meshes,                MESH;
-    Emissive,            emissives,             EMISSIVE;
+    LOCAL_TRANSFORM       => LocalTransform,      local_transforms;
+    GLOBAL_TRANSFORM      => GlobalTransform,     global_transforms;
+    PARENT                => Parent,              parents;
+    LOCAL_TRANSFORM_DIRTY => LocalTransformDirty, local_transform_dirty;
+    CAMERA                => Camera,              cameras;
+    PAN_ORBIT_CAMERA      => PanOrbitCamera,      pan_orbit_cameras;
+    MESH                  => Mesh,                meshes;
+    EMISSIVE              => Emissive,            emissives;
 );
 
 type System = fn(&mut World);
