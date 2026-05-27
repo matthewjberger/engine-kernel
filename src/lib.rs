@@ -899,6 +899,16 @@ fn initialize_world(world: &mut World) {
         emissive.0 = nalgebra_glm::vec3(4.0, 2.2, 0.8);
     }
     mark_local_transform_dirty(world, cube);
+
+    let ground = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | EMISSIVE);
+    if let Some(local) = get_local_transform_mut(world, ground) {
+        local.translation = nalgebra_glm::vec3(0.0, -1.0, 0.0);
+        local.scale = nalgebra_glm::vec3(10.0, 0.1, 10.0);
+    }
+    if let Some(emissive) = get_emissive_mut(world, ground) {
+        emissive.0 = nalgebra_glm::vec3(0.12, 0.12, 0.12);
+    }
+    mark_local_transform_dirty(world, ground);
 }
 
 const TRIANGLE_VERTICES: [f32; 27] = [
