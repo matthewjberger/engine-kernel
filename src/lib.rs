@@ -74,6 +74,9 @@ struct Parent(Option<Entity>);
 #[derive(Clone, Copy, Default)]
 struct LocalTransformDirty;
 
+#[derive(Clone, Copy, Default)]
+struct Mesh;
+
 #[derive(Clone, Copy)]
 struct PerspectiveCamera {
     y_fov_radians: f32,
@@ -184,6 +187,7 @@ const PARENT: u64 = 4;
 const LOCAL_TRANSFORM_DIRTY: u64 = 8;
 const CAMERA: u64 = 16;
 const PAN_ORBIT_CAMERA: u64 = 32;
+const MESH: u64 = 64;
 
 macro_rules! components {
     ($($name:ty, $field:ident, $bit:expr);* $(;)?) => {
@@ -236,6 +240,7 @@ components!(
     LocalTransformDirty, local_transform_dirty, LOCAL_TRANSFORM_DIRTY;
     Camera,              cameras,               CAMERA;
     PanOrbitCamera,      pan_orbit_cameras,     PAN_ORBIT_CAMERA;
+    Mesh,                meshes,                MESH;
 );
 
 type System = fn(&mut World);
@@ -523,14 +528,6 @@ fn get_pan_orbit_camera_mut(world: &mut World, entity: Entity) -> Option<&mut Pa
     })
 }
 
-fn count_entities(world: &mut World, mask: u64) -> usize {
-    query_tables(world, mask)
-        .to_vec()
-        .iter()
-        .map(|&table| world.tables[table].entities.len())
-        .sum()
-}
-
 fn collect_entities(world: &mut World, mask: u64) -> Vec<Entity> {
     let mut entities = Vec::new();
     for table in query_tables(world, mask).to_vec() {
@@ -540,7 +537,7 @@ fn collect_entities(world: &mut World, mask: u64) -> Vec<Entity> {
 }
 
 fn mark_local_transform_dirty(world: &mut World, entity: Entity) {
-    if world.transform_state.children_cache.is_empty() && count_entities(world, PARENT) > 0 {
+    if !world.transform_state.children_cache_valid {
         rebuild_children_cache(world);
     }
 
@@ -639,21 +636,11 @@ fn update_global_transforms_system(world: &mut World) {
     }
 }
 
-fn transform_system(world: &mut World) {
-    if !world.transform_state.children_cache_valid {
-        rebuild_children_cache(world);
-    }
-    update_global_transforms_system(world);
-}
-
 const SPIN_SPEED: f32 = 0.8;
 
 fn spin_system(world: &mut World) {
     let delta_time = world.delta_time;
-    for entity in collect_entities(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM) {
-        if entity_has(world, entity, CAMERA) {
-            continue;
-        }
+    for entity in collect_entities(world, MESH) {
         if let Some(local) = get_local_transform_mut(world, entity) {
             let spin = nalgebra_glm::quat_angle_axis(SPIN_SPEED * delta_time, &Vec3::y());
             local.rotation = spin * local.rotation;
@@ -796,7 +783,7 @@ fn view_projection_matrix(world: &World, aspect_ratio: f32) -> Option<Mat4> {
 fn renderable_models(world: &World) -> Vec<Mat4> {
     let mut models = Vec::new();
     for table in &world.tables {
-        if table.mask & GLOBAL_TRANSFORM == 0 || table.mask & CAMERA != 0 {
+        if table.mask & (MESH | GLOBAL_TRANSFORM) != (MESH | GLOBAL_TRANSFORM) {
             continue;
         }
         for entry in &table.global_transforms {
@@ -825,7 +812,11 @@ fn run_frame_systems(world: &mut World) {
 fn initialize_world(world: &mut World) {
     schedule_push(&mut world.schedule, "spin", spin_system);
     schedule_push(&mut world.schedule, "pan_orbit", pan_orbit_camera_system);
-    schedule_push(&mut world.schedule, "transforms", transform_system);
+    schedule_push(
+        &mut world.schedule,
+        "transforms",
+        update_global_transforms_system,
+    );
 
     let camera = spawn(
         world,
@@ -843,7 +834,7 @@ fn initialize_world(world: &mut World) {
     let count = 12;
     for index in 0..count {
         let angle = index as f32 / count as f32 * std::f32::consts::TAU;
-        let triangle = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM);
+        let triangle = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | MESH);
         if let Some(local) = get_local_transform_mut(world, triangle) {
             local.translation = nalgebra_glm::vec3(angle.cos() * 3.0, 0.0, angle.sin() * 3.0);
             local.scale = nalgebra_glm::vec3(0.6, 0.6, 0.6);
@@ -884,7 +875,261 @@ struct VertexOutput {
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-struct TriangleResources {
+struct ResourceDesc {
+    external: bool,
+    format: wgpu::TextureFormat,
+    clear_color: wgpu::Color,
+    clear_depth: f32,
+}
+
+struct GraphPass {
+    node: Box<dyn PassNode>,
+    bindings: HashMap<&'static str, usize>,
+}
+
+#[derive(Default)]
+struct RenderGraph {
+    resources: Vec<ResourceDesc>,
+    passes: Vec<GraphPass>,
+    execution_order: Vec<usize>,
+    clears: HashSet<(usize, usize)>,
+    transient_views: Vec<Option<wgpu::TextureView>>,
+    size: (u32, u32),
+}
+
+struct PassContext<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    encoder: &'a mut wgpu::CommandEncoder,
+    world: &'a World,
+    aspect_ratio: f32,
+    resources: &'a [ResourceDesc],
+    views: &'a [Option<&'a wgpu::TextureView>],
+    bindings: &'a HashMap<&'static str, usize>,
+    clears: &'a HashSet<(usize, usize)>,
+    pass_index: usize,
+}
+
+trait PassNode {
+    fn reads(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+    fn writes(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+    fn execute(&mut self, context: &mut PassContext);
+}
+
+fn add_color_resource(
+    graph: &mut RenderGraph,
+    external: bool,
+    format: wgpu::TextureFormat,
+    clear_color: wgpu::Color,
+) -> usize {
+    graph.resources.push(ResourceDesc {
+        external,
+        format,
+        clear_color,
+        clear_depth: 0.0,
+    });
+    graph.resources.len() - 1
+}
+
+fn add_depth_resource(
+    graph: &mut RenderGraph,
+    format: wgpu::TextureFormat,
+    clear_depth: f32,
+) -> usize {
+    graph.resources.push(ResourceDesc {
+        external: false,
+        format,
+        clear_color: wgpu::Color::BLACK,
+        clear_depth,
+    });
+    graph.resources.len() - 1
+}
+
+fn add_pass(graph: &mut RenderGraph, node: Box<dyn PassNode>, bindings: &[(&'static str, usize)]) {
+    graph.passes.push(GraphPass {
+        node,
+        bindings: bindings.iter().copied().collect(),
+    });
+}
+
+fn pass_resource_ids(pass: &GraphPass, slots: Vec<&'static str>) -> Vec<usize> {
+    slots
+        .iter()
+        .filter_map(|slot| pass.bindings.get(slot).copied())
+        .collect()
+}
+
+fn render_graph_compile(graph: &mut RenderGraph) {
+    let reads_writes: Vec<(Vec<usize>, Vec<usize>)> = graph
+        .passes
+        .iter()
+        .map(|pass| {
+            (
+                pass_resource_ids(pass, pass.node.reads()),
+                pass_resource_ids(pass, pass.node.writes()),
+            )
+        })
+        .collect();
+
+    let pass_count = reads_writes.len();
+    let mut adjacency = vec![Vec::new(); pass_count];
+    let mut indegree = vec![0usize; pass_count];
+    let mut last_writer: HashMap<usize, usize> = HashMap::new();
+    for (index, (reads, writes)) in reads_writes.iter().enumerate() {
+        for resource in reads.iter().chain(writes.iter()) {
+            if let Some(&writer) = last_writer.get(resource)
+                && writer != index
+            {
+                adjacency[writer].push(index);
+                indegree[index] += 1;
+            }
+        }
+        for resource in writes {
+            last_writer.insert(*resource, index);
+        }
+    }
+
+    let mut ready: Vec<usize> = (0..pass_count)
+        .filter(|&index| indegree[index] == 0)
+        .collect();
+    let mut order = Vec::with_capacity(pass_count);
+    let mut cursor = 0;
+    while cursor < ready.len() {
+        let node = ready[cursor];
+        cursor += 1;
+        order.push(node);
+        for &next in &adjacency[node] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                ready.push(next);
+            }
+        }
+    }
+
+    let mut cleared = HashSet::new();
+    graph.clears.clear();
+    for &index in &order {
+        for &resource in &reads_writes[index].1 {
+            if cleared.insert(resource) {
+                graph.clears.insert((index, resource));
+            }
+        }
+    }
+    graph.execution_order = order;
+}
+
+fn ensure_transient_textures(graph: &mut RenderGraph, device: &wgpu::Device, size: (u32, u32)) {
+    if graph.size == size && !graph.transient_views.is_empty() {
+        return;
+    }
+    graph.transient_views = graph
+        .resources
+        .iter()
+        .map(|resource| {
+            (!resource.external).then(|| {
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: size.0.max(1),
+                        height: size.1.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: resource.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                texture.create_view(&Default::default())
+            })
+        })
+        .collect();
+    graph.size = size;
+}
+
+fn color_attachment<'a>(
+    context: &PassContext<'a>,
+    slot: &str,
+) -> (
+    &'a wgpu::TextureView,
+    wgpu::LoadOp<wgpu::Color>,
+    wgpu::StoreOp,
+) {
+    let resource = context.bindings[slot];
+    let view = context.views[resource].expect("unbound color attachment");
+    let load = if context.clears.contains(&(context.pass_index, resource)) {
+        wgpu::LoadOp::Clear(context.resources[resource].clear_color)
+    } else {
+        wgpu::LoadOp::Load
+    };
+    (view, load, wgpu::StoreOp::Store)
+}
+
+fn depth_attachment<'a>(
+    context: &PassContext<'a>,
+    slot: &str,
+) -> (&'a wgpu::TextureView, wgpu::LoadOp<f32>, wgpu::StoreOp) {
+    let resource = context.bindings[slot];
+    let view = context.views[resource].expect("unbound depth attachment");
+    let load = if context.clears.contains(&(context.pass_index, resource)) {
+        wgpu::LoadOp::Clear(context.resources[resource].clear_depth)
+    } else {
+        wgpu::LoadOp::Load
+    };
+    (view, load, wgpu::StoreOp::Store)
+}
+
+fn render_graph_execute(
+    graph: &mut RenderGraph,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    world: &World,
+    aspect_ratio: f32,
+    external: &wgpu::TextureView,
+    size: (u32, u32),
+) -> wgpu::CommandBuffer {
+    ensure_transient_textures(graph, device, size);
+
+    let views: Vec<Option<&wgpu::TextureView>> = graph
+        .resources
+        .iter()
+        .enumerate()
+        .map(|(id, resource)| {
+            if resource.external {
+                Some(external)
+            } else {
+                graph.transient_views[id].as_ref()
+            }
+        })
+        .collect();
+
+    let mut encoder = device.create_command_encoder(&Default::default());
+    for index in graph.execution_order.clone() {
+        let bindings = graph.passes[index].bindings.clone();
+        let mut context = PassContext {
+            device,
+            queue,
+            encoder: &mut encoder,
+            world,
+            aspect_ratio,
+            resources: &graph.resources,
+            views: &views,
+            bindings: &bindings,
+            clears: &graph.clears,
+            pass_index: index,
+        };
+        graph.passes[index].node.execute(&mut context);
+    }
+    encoder.finish()
+}
+
+struct TrianglePass {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
@@ -893,101 +1138,74 @@ struct TriangleResources {
     bind_group: wgpu::BindGroup,
 }
 
-struct RenderResources {
-    triangle: TriangleResources,
-}
-
-struct PassContext<'a> {
-    device: &'a wgpu::Device,
-    queue: &'a wgpu::Queue,
-    encoder: &'a mut wgpu::CommandEncoder,
-    color_view: &'a wgpu::TextureView,
-    depth_view: &'a wgpu::TextureView,
-    world: &'a World,
-    aspect_ratio: f32,
-    resources: &'a mut RenderResources,
-}
-
-type Pass = fn(&mut PassContext);
-
-#[derive(Default)]
-struct RenderGraph {
-    passes: Vec<(&'static str, Pass)>,
-}
-
-fn render_graph_execute(graph: &RenderGraph, context: &mut PassContext) {
-    for (_, pass) in &graph.passes {
-        pass(context);
+impl PassNode for TrianglePass {
+    fn writes(&self) -> Vec<&'static str> {
+        vec!["color", "depth"]
     }
-}
 
-fn triangle_pass(context: &mut PassContext) {
-    let view_projection =
-        view_projection_matrix(context.world, context.aspect_ratio).unwrap_or_else(Mat4::identity);
-    context.queue.write_buffer(
-        &context.resources.triangle.view_projection_buffer,
-        0,
-        bytemuck::cast_slice(view_projection.as_slice()),
-    );
-
-    let models = renderable_models(context.world);
-    let instance_count = models.len() as u32;
-
-    let triangle = &mut context.resources.triangle;
-    if instance_count > triangle.instance_capacity {
-        triangle.instance_capacity = instance_count.next_power_of_two();
-        triangle.instance_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: triangle.instance_capacity as u64 * 64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-    }
-    if instance_count > 0 {
-        let mut instance_data: Vec<f32> = Vec::with_capacity(models.len() * 16);
-        for model in &models {
-            instance_data.extend_from_slice(model.as_slice());
-        }
+    fn execute(&mut self, context: &mut PassContext) {
+        let view_projection = view_projection_matrix(context.world, context.aspect_ratio)
+            .unwrap_or_else(Mat4::identity);
         context.queue.write_buffer(
-            &triangle.instance_buffer,
+            &self.view_projection_buffer,
             0,
-            bytemuck::cast_slice(&instance_data),
+            bytemuck::cast_slice(view_projection.as_slice()),
         );
-    }
 
-    let mut pass = context
-        .encoder
-        .begin_render_pass(&wgpu::RenderPassDescriptor {
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: context.color_view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.02,
-                        g: 0.02,
-                        b: 0.05,
-                        a: 1.0,
+        let models = renderable_models(context.world);
+        let instance_count = models.len() as u32;
+        if instance_count > self.instance_capacity {
+            self.instance_capacity = instance_count.next_power_of_two();
+            self.instance_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: self.instance_capacity as u64 * 64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if instance_count > 0 {
+            let mut instance_data: Vec<f32> = Vec::with_capacity(models.len() * 16);
+            for model in &models {
+                instance_data.extend_from_slice(model.as_slice());
+            }
+            context.queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                bytemuck::cast_slice(&instance_data),
+            );
+        }
+
+        let (color_view, color_load, color_store) = color_attachment(context, "color");
+        let (depth_view, depth_load, depth_store) = depth_attachment(context, "depth");
+        let mut pass = context
+            .encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: color_load,
+                        store: color_store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: depth_load,
+                        store: depth_store,
                     }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: context.depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(0.0),
-                    store: wgpu::StoreOp::Store,
+                    stencil_ops: None,
                 }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        });
-    if instance_count > 0 {
-        pass.set_pipeline(&triangle.pipeline);
-        pass.set_bind_group(0, &triangle.bind_group, &[]);
-        pass.set_vertex_buffer(0, triangle.vertex_buffer.slice(..));
-        pass.set_vertex_buffer(1, triangle.instance_buffer.slice(..));
-        pass.draw(0..3, 0..instance_count);
+                ..Default::default()
+            });
+        if instance_count > 0 {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            pass.draw(0..3, 0..instance_count);
+        }
     }
 }
 
@@ -1009,11 +1227,9 @@ struct Graphics {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_config: wgpu::SurfaceConfiguration,
-    depth_view: wgpu::TextureView,
     egui_renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
     graph: RenderGraph,
-    render_resources: RenderResources,
     size: (u32, u32),
 }
 
@@ -1023,24 +1239,6 @@ pub struct App {
     graphics: Option<Graphics>,
     #[cfg(target_arch = "wasm32")]
     pending: Option<futures::channel::oneshot::Receiver<Graphics>>,
-}
-
-fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    texture.create_view(&Default::default())
 }
 
 async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics {
@@ -1140,8 +1338,6 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         }],
     });
 
-    let depth_view = create_depth_view(&device, width, height);
-
     let egui_renderer = egui_wgpu::Renderer::new(
         &device,
         surface_config.format,
@@ -1160,19 +1356,32 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         None,
     );
 
-    let render_resources = RenderResources {
-        triangle: TriangleResources {
+    let mut graph = RenderGraph::default();
+    let swapchain = add_color_resource(
+        &mut graph,
+        true,
+        surface_config.format,
+        wgpu::Color {
+            r: 0.02,
+            g: 0.02,
+            b: 0.05,
+            a: 1.0,
+        },
+    );
+    let depth = add_depth_resource(&mut graph, DEPTH_FORMAT, 0.0);
+    add_pass(
+        &mut graph,
+        Box::new(TrianglePass {
             pipeline,
             vertex_buffer,
             instance_buffer,
             instance_capacity: 1,
             view_projection_buffer,
             bind_group,
-        },
-    };
-    let graph = RenderGraph {
-        passes: vec![("triangle", triangle_pass)],
-    };
+        }),
+        &[("color", swapchain), ("depth", depth)],
+    );
+    render_graph_compile(&mut graph);
 
     Graphics {
         window,
@@ -1180,11 +1389,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         device,
         queue,
         surface_config,
-        depth_view,
         egui_renderer,
         egui_state,
         graph,
-        render_resources,
         size: (width, height),
     }
 }
@@ -1196,7 +1403,6 @@ fn resize(graphics: &mut Graphics, width: u32, height: u32) {
     graphics
         .surface
         .configure(&graphics.device, &graphics.surface_config);
-    graphics.depth_view = create_depth_view(&graphics.device, width, height);
 }
 
 fn render(graphics: &mut Graphics, world: &World) {
@@ -1272,32 +1478,27 @@ fn render(graphics: &mut Graphics, world: &World) {
         }
     };
     let frame_view = frame.texture.create_view(&Default::default());
-    let mut encoder = graphics.device.create_command_encoder(&Default::default());
 
+    let graph_commands = render_graph_execute(
+        &mut graphics.graph,
+        &graphics.device,
+        &graphics.queue,
+        world,
+        aspect_ratio,
+        &frame_view,
+        (width, height),
+    );
+
+    let mut egui_encoder = graphics.device.create_command_encoder(&Default::default());
     graphics.egui_renderer.update_buffers(
         &graphics.device,
         &graphics.queue,
-        &mut encoder,
+        &mut egui_encoder,
         &paint_jobs,
         &screen_descriptor,
     );
-
     {
-        let mut context = PassContext {
-            device: &graphics.device,
-            queue: &graphics.queue,
-            encoder: &mut encoder,
-            color_view: &frame_view,
-            depth_view: &graphics.depth_view,
-            world,
-            aspect_ratio,
-            resources: &mut graphics.render_resources,
-        };
-        render_graph_execute(&graphics.graph, &mut context);
-    }
-
-    {
-        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &frame_view,
                 resolve_target: None,
@@ -1314,7 +1515,9 @@ fn render(graphics: &mut Graphics, world: &World) {
             .render(&mut pass.forget_lifetime(), &paint_jobs, &screen_descriptor);
     }
 
-    graphics.queue.submit([encoder.finish()]);
+    graphics
+        .queue
+        .submit([graph_commands, egui_encoder.finish()]);
     frame.present();
 }
 
