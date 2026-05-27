@@ -948,7 +948,7 @@ impl State for Demo {
             local.scale = nalgebra_glm::vec3(10.0, 0.1, 10.0);
         }
         if let Some(emissive) = get_emissive_mut(world, ground) {
-            emissive.0 = nalgebra_glm::vec3(0.12, 0.12, 0.12);
+            emissive.0 = nalgebra_glm::vec3(0.6, 0.6, 0.6);
         }
         mark_local_transform_dirty(world, ground);
     }
@@ -1018,8 +1018,10 @@ struct GeometryOutput {
 }
 @fragment fn fs(in: VertexOutput) -> GeometryOutput {
     let tint = tints[in.instance % 64u].rgb;
+    let emissive_surface = in.emissive.r + in.emissive.g + in.emissive.b > 0.0;
+    let shaded = select(in.color.rgb * tint, in.color.rgb * in.emissive, emissive_surface);
     var out: GeometryOutput;
-    out.color = vec4<f32>(in.color.rgb * (tint + in.emissive), 1.0);
+    out.color = vec4<f32>(shaded, 1.0);
     out.normal = vec4<f32>(normalize(in.view_normal), 1.0);
     return out;
 }
