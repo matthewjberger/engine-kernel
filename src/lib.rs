@@ -848,8 +848,11 @@ const TRIANGLE_VERTICES: [f32; 18] = [
     1., -1., 0., 1., 0., 0., -1., -1., 0., 0., 1., 0., 0., 1., 0., 0., 0., 1.,
 ];
 
+const TINT_COUNT: u64 = 64;
+
 const SHADER: &str = "
 @group(0) @binding(0) var<uniform> view_projection: mat4x4<f32>;
+@group(1) @binding(0) var<storage, read> tints: array<vec4<f32>, 64>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -862,14 +865,35 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) @interpolate(flat) instance: u32,
 }
-@vertex fn vs(in: VertexInput) -> VertexOutput {
+@vertex fn vs(in: VertexInput, @builtin(instance_index) instance_index: u32) -> VertexOutput {
     let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
     let clip = view_projection * model * vec4<f32>(in.position, 1.0);
-    return VertexOutput(clip, vec4<f32>(in.color, 1.0));
+    return VertexOutput(clip, vec4<f32>(in.color, 1.0), instance_index);
 }
 @fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
-    return in.color;
+    let tint = tints[in.instance % 64u].rgb;
+    return vec4<f32>(in.color.rgb * tint, 1.0);
+}
+";
+
+const COMPUTE_SHADER: &str = "
+@group(0) @binding(0) var<storage, read_write> tints: array<vec4<f32>, 64>;
+@group(0) @binding(1) var<uniform> params: vec4<f32>;
+@compute @workgroup_size(64)
+fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x;
+    if (index >= 64u) {
+        return;
+    }
+    let phase = params.x + f32(index) * 0.3;
+    tints[index] = vec4<f32>(
+        0.5 + 0.5 * sin(phase),
+        0.5 + 0.5 * sin(phase + 2.094),
+        0.5 + 0.5 * sin(phase + 4.188),
+        1.0,
+    );
 }
 ";
 
@@ -911,10 +935,18 @@ enum Clear {
     Depth(f32),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResourceKind {
+    Texture,
+    Buffer,
+}
+
 struct ResourceDesc {
+    kind: ResourceKind,
     external: bool,
     format: wgpu::TextureFormat,
     clear: Clear,
+    buffer_size: u64,
 }
 
 struct GraphPass {
@@ -932,6 +964,7 @@ struct RenderGraph {
     resource_physical: Vec<Option<usize>>,
     physical_formats: Vec<wgpu::TextureFormat>,
     physical_views: Vec<wgpu::TextureView>,
+    buffers: Vec<Option<wgpu::Buffer>>,
     size: (u32, u32),
 }
 
@@ -943,6 +976,7 @@ struct PassContext<'a> {
     aspect_ratio: f32,
     resources: &'a [ResourceDesc],
     views: &'a [Option<&'a wgpu::TextureView>],
+    buffers: &'a [Option<&'a wgpu::Buffer>],
     bindings: &'a HashMap<&'static str, usize>,
     clears: &'a HashSet<(usize, usize)>,
     stores: &'a HashSet<(usize, usize)>,
@@ -959,12 +993,16 @@ trait PassNode {
     fn depth_write(&self) -> Option<&'static str> {
         None
     }
+    fn buffer_writes(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
     fn execute(&mut self, context: &mut PassContext);
 }
 
 fn write_slots(node: &dyn PassNode) -> Vec<&'static str> {
     let mut slots = node.color_writes();
     slots.extend(node.depth_write());
+    slots.extend(node.buffer_writes());
     slots
 }
 
@@ -975,9 +1013,11 @@ fn add_color_resource(
     clear_color: wgpu::Color,
 ) -> usize {
     graph.resources.push(ResourceDesc {
+        kind: ResourceKind::Texture,
         external,
         format,
         clear: Clear::Color(clear_color),
+        buffer_size: 0,
     });
     graph.resources.len() - 1
 }
@@ -988,9 +1028,22 @@ fn add_depth_resource(
     clear_depth: f32,
 ) -> usize {
     graph.resources.push(ResourceDesc {
+        kind: ResourceKind::Texture,
         external: false,
         format,
         clear: Clear::Depth(clear_depth),
+        buffer_size: 0,
+    });
+    graph.resources.len() - 1
+}
+
+fn add_buffer_resource(graph: &mut RenderGraph, size: u64) -> usize {
+    graph.resources.push(ResourceDesc {
+        kind: ResourceKind::Buffer,
+        external: false,
+        format: SCENE_FORMAT,
+        clear: Clear::Depth(0.0),
+        buffer_size: size,
     });
     graph.resources.len() - 1
 }
@@ -1129,7 +1182,11 @@ fn render_graph_compile(graph: &mut RenderGraph) {
     }
 
     let mut transient: Vec<usize> = (0..resource_count)
-        .filter(|&resource| used[resource] && !graph.resources[resource].external)
+        .filter(|&resource| {
+            used[resource]
+                && !graph.resources[resource].external
+                && graph.resources[resource].kind == ResourceKind::Texture
+        })
         .collect();
     transient.sort_by_key(|&resource| first_use[resource]);
 
@@ -1158,11 +1215,25 @@ fn render_graph_compile(graph: &mut RenderGraph) {
     graph.resource_physical = resource_physical;
     graph.physical_formats = physical_formats;
     graph.physical_views.clear();
+    graph.buffers = (0..resource_count).map(|_| None).collect();
     graph.size = (0, 0);
     graph.execution_order = order;
 }
 
-fn ensure_physical_textures(graph: &mut RenderGraph, device: &wgpu::Device, size: (u32, u32)) {
+fn ensure_resources(graph: &mut RenderGraph, device: &wgpu::Device, size: (u32, u32)) {
+    for resource in 0..graph.resources.len() {
+        if graph.resources[resource].kind == ResourceKind::Buffer
+            && graph.buffers[resource].is_none()
+        {
+            graph.buffers[resource] = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: graph.resources[resource].buffer_size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }));
+        }
+    }
+
     if graph.size == size && graph.physical_views.len() == graph.physical_formats.len() {
         return;
     }
@@ -1202,6 +1273,11 @@ fn store_op(context: &PassContext, resource: usize) -> wgpu::StoreOp {
 fn read_view<'a>(context: &PassContext<'a>, slot: &str) -> &'a wgpu::TextureView {
     let resource = context.bindings[slot];
     context.views[resource].expect("unbound read resource")
+}
+
+fn graph_buffer<'a>(context: &PassContext<'a>, slot: &str) -> &'a wgpu::Buffer {
+    let resource = context.bindings[slot];
+    context.buffers[resource].expect("unbound buffer resource")
 }
 
 fn color_attachment<'a>(
@@ -1249,7 +1325,7 @@ fn render_graph_execute(
     external: &wgpu::TextureView,
     size: (u32, u32),
 ) -> wgpu::CommandBuffer {
-    ensure_physical_textures(graph, device, size);
+    ensure_resources(graph, device, size);
 
     let views: Vec<Option<&wgpu::TextureView>> = graph
         .resources
@@ -1263,6 +1339,8 @@ fn render_graph_execute(
             }
         })
         .collect();
+    let buffers: Vec<Option<&wgpu::Buffer>> =
+        graph.buffers.iter().map(|buffer| buffer.as_ref()).collect();
 
     let mut encoder = device.create_command_encoder(&Default::default());
     for index in graph.execution_order.clone() {
@@ -1275,6 +1353,7 @@ fn render_graph_execute(
             aspect_ratio,
             resources: &graph.resources,
             views: &views,
+            buffers: &buffers,
             bindings: &bindings,
             clears: &graph.clears,
             stores: &graph.stores,
@@ -1292,9 +1371,14 @@ struct TrianglePass {
     instance_capacity: u32,
     view_projection_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    tint_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl PassNode for TrianglePass {
+    fn reads(&self) -> Vec<&'static str> {
+        vec!["tints"]
+    }
+
     fn color_writes(&self) -> Vec<&'static str> {
         vec!["color"]
     }
@@ -1335,6 +1419,18 @@ impl PassNode for TrianglePass {
             );
         }
 
+        let tints = graph_buffer(context, "tints");
+        let tint_bind_group = context
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.tint_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: tints.as_entire_binding(),
+                }],
+            });
+
         let (color_view, color_load, color_store) = color_attachment(context, "color");
         let (depth_view, depth_load, depth_store) = depth_attachment(context, "depth");
         let mut pass = context
@@ -1362,6 +1458,7 @@ impl PassNode for TrianglePass {
         if instance_count > 0 {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, &tint_bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             pass.draw(0..3, 0..instance_count);
@@ -1422,6 +1519,52 @@ impl PassNode for TonemapPass {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.draw(0..3, 0..1);
+    }
+}
+
+struct ComputeTintPass {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    params_buffer: wgpu::Buffer,
+    time: f32,
+}
+
+impl PassNode for ComputeTintPass {
+    fn buffer_writes(&self) -> Vec<&'static str> {
+        vec!["tints"]
+    }
+
+    fn execute(&mut self, context: &mut PassContext) {
+        self.time += context.world.delta_time;
+        let params = [self.time, 0.0, 0.0, 0.0];
+        context
+            .queue
+            .write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&params));
+
+        let tints = graph_buffer(context, "tints");
+        let bind_group = context
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: tints.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let mut pass = context
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
     }
 }
 
@@ -1585,6 +1728,27 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             resource: view_projection_buffer.as_entire_binding(),
         }],
     });
+    let tint_bind_group_layout = pipeline.get_bind_group_layout(1);
+
+    let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(COMPUTE_SHADER.into()),
+    });
+    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &compute_shader,
+        entry_point: Some("cs"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let compute_bind_group_layout = compute_pipeline.get_bind_group_layout(0);
+    let compute_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
 
     let egui_renderer = egui_wgpu::Renderer::new(
         &device,
@@ -1614,6 +1778,17 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let swapchain = add_color_resource(&mut graph, true, surface_config.format, background);
     let scene = add_color_resource(&mut graph, false, SCENE_FORMAT, background);
     let depth = add_depth_resource(&mut graph, DEPTH_FORMAT, 0.0);
+    let tints = add_buffer_resource(&mut graph, TINT_COUNT * 16);
+    add_pass(
+        &mut graph,
+        Box::new(ComputeTintPass {
+            pipeline: compute_pipeline,
+            bind_group_layout: compute_bind_group_layout,
+            params_buffer: compute_params_buffer,
+            time: 0.0,
+        }),
+        &[("tints", tints)],
+    );
     add_pass(
         &mut graph,
         Box::new(TrianglePass {
@@ -1623,8 +1798,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             instance_capacity: 1,
             view_projection_buffer,
             bind_group,
+            tint_bind_group_layout,
         }),
-        &[("color", scene), ("depth", depth)],
+        &[("color", scene), ("depth", depth), ("tints", tints)],
     );
     add_pass(
         &mut graph,
