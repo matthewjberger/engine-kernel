@@ -796,15 +796,23 @@ fn pan_orbit_camera_system(world: &mut World) {
     mark_local_transform_dirty(world, camera);
 }
 
-fn view_projection_matrix(world: &World, aspect_ratio: f32) -> Option<Mat4> {
+fn camera_view(world: &World) -> Option<Mat4> {
     let camera_entity = world.active_camera?;
-    let camera = get_camera(world, camera_entity)?;
     let global = get_global_transform(world, camera_entity)?.0;
     let position = transform_translation(&global);
     let target = position + transform_forward(&global);
     let up = transform_up(&global);
-    let view = nalgebra_glm::look_at(&position, &target, &up);
-    Some(perspective_matrix(&camera.projection, aspect_ratio) * view)
+    Some(nalgebra_glm::look_at(&position, &target, &up))
+}
+
+fn camera_projection(world: &World, aspect_ratio: f32) -> Option<Mat4> {
+    let camera_entity = world.active_camera?;
+    let camera = get_camera(world, camera_entity)?;
+    Some(perspective_matrix(&camera.projection, aspect_ratio))
+}
+
+fn view_projection_matrix(world: &World, aspect_ratio: f32) -> Option<Mat4> {
+    Some(camera_projection(world, aspect_ratio)? * camera_view(world)?)
 }
 
 fn renderable_models(world: &World) -> Vec<Mat4> {
@@ -893,34 +901,45 @@ fn initialize_world(world: &mut World) {
     mark_local_transform_dirty(world, cube);
 }
 
-const TRIANGLE_VERTICES: [f32; 18] = [
-    1., -1., 0., 1., 0., 0., -1., -1., 0., 0., 1., 0., 0., 1., 0., 0., 0., 1.,
+const TRIANGLE_VERTICES: [f32; 27] = [
+    1., -1., 0., 1., 0., 0., 0., 0., 1., -1., -1., 0., 0., 1., 0., 0., 0., 1., 0., 1., 0., 0., 0.,
+    1., 0., 0., 1.,
 ];
 
-const CUBE_VERTICES: [f32; 216] = [
-    1., -1., -1., 1., 1., 1., 1., 1., -1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., -1., -1., 1.,
-    1., 1., 1., 1., 1., 1., 1., 1., 1., -1., 1., 1., 1., 1., -1., -1., -1., 0.55, 0.55, 0.55, -1.,
-    1., 1., 0.55, 0.55, 0.55, -1., 1., -1., 0.55, 0.55, 0.55, -1., -1., -1., 0.55, 0.55, 0.55, -1.,
-    -1., 1., 0.55, 0.55, 0.55, -1., 1., 1., 0.55, 0.55, 0.55, -1., 1., -1., 0.9, 0.9, 0.9, -1., 1.,
-    1., 0.9, 0.9, 0.9, 1., 1., 1., 0.9, 0.9, 0.9, -1., 1., -1., 0.9, 0.9, 0.9, 1., 1., 1., 0.9,
-    0.9, 0.9, 1., 1., -1., 0.9, 0.9, 0.9, -1., -1., -1., 0.45, 0.45, 0.45, 1., -1., 1., 0.45, 0.45,
-    0.45, -1., -1., 1., 0.45, 0.45, 0.45, -1., -1., -1., 0.45, 0.45, 0.45, 1., -1., -1., 0.45,
-    0.45, 0.45, 1., -1., 1., 0.45, 0.45, 0.45, -1., -1., 1., 0.8, 0.8, 0.8, 1., -1., 1., 0.8, 0.8,
-    0.8, 1., 1., 1., 0.8, 0.8, 0.8, -1., -1., 1., 0.8, 0.8, 0.8, 1., 1., 1., 0.8, 0.8, 0.8, -1.,
-    1., 1., 0.8, 0.8, 0.8, -1., -1., -1., 0.65, 0.65, 0.65, 1., 1., -1., 0.65, 0.65, 0.65, 1., -1.,
-    -1., 0.65, 0.65, 0.65, -1., -1., -1., 0.65, 0.65, 0.65, -1., 1., -1., 0.65, 0.65, 0.65, 1., 1.,
-    -1., 0.65, 0.65, 0.65,
+const CUBE_VERTICES: [f32; 324] = [
+    1., -1., -1., 1., 1., 1., 1., 0., 0., 1., 1., -1., 1., 1., 1., 1., 0., 0., 1., 1., 1., 1., 1.,
+    1., 1., 0., 0., 1., -1., -1., 1., 1., 1., 1., 0., 0., 1., 1., 1., 1., 1., 1., 1., 0., 0., 1.,
+    -1., 1., 1., 1., 1., 1., 0., 0., -1., -1., -1., 0.55, 0.55, 0.55, -1., 0., 0., -1., 1., 1.,
+    0.55, 0.55, 0.55, -1., 0., 0., -1., 1., -1., 0.55, 0.55, 0.55, -1., 0., 0., -1., -1., -1.,
+    0.55, 0.55, 0.55, -1., 0., 0., -1., -1., 1., 0.55, 0.55, 0.55, -1., 0., 0., -1., 1., 1., 0.55,
+    0.55, 0.55, -1., 0., 0., -1., 1., -1., 0.9, 0.9, 0.9, 0., 1., 0., -1., 1., 1., 0.9, 0.9, 0.9,
+    0., 1., 0., 1., 1., 1., 0.9, 0.9, 0.9, 0., 1., 0., -1., 1., -1., 0.9, 0.9, 0.9, 0., 1., 0., 1.,
+    1., 1., 0.9, 0.9, 0.9, 0., 1., 0., 1., 1., -1., 0.9, 0.9, 0.9, 0., 1., 0., -1., -1., -1., 0.45,
+    0.45, 0.45, 0., -1., 0., 1., -1., 1., 0.45, 0.45, 0.45, 0., -1., 0., -1., -1., 1., 0.45, 0.45,
+    0.45, 0., -1., 0., -1., -1., -1., 0.45, 0.45, 0.45, 0., -1., 0., 1., -1., -1., 0.45, 0.45,
+    0.45, 0., -1., 0., 1., -1., 1., 0.45, 0.45, 0.45, 0., -1., 0., -1., -1., 1., 0.8, 0.8, 0.8, 0.,
+    0., 1., 1., -1., 1., 0.8, 0.8, 0.8, 0., 0., 1., 1., 1., 1., 0.8, 0.8, 0.8, 0., 0., 1., -1.,
+    -1., 1., 0.8, 0.8, 0.8, 0., 0., 1., 1., 1., 1., 0.8, 0.8, 0.8, 0., 0., 1., -1., 1., 1., 0.8,
+    0.8, 0.8, 0., 0., 1., -1., -1., -1., 0.65, 0.65, 0.65, 0., 0., -1., 1., 1., -1., 0.65, 0.65,
+    0.65, 0., 0., -1., 1., -1., -1., 0.65, 0.65, 0.65, 0., 0., -1., -1., -1., -1., 0.65, 0.65,
+    0.65, 0., 0., -1., -1., 1., -1., 0.65, 0.65, 0.65, 0., 0., -1., 1., 1., -1., 0.65, 0.65, 0.65,
+    0., 0., -1.,
 ];
 
 const TINT_COUNT: u64 = 64;
 
 const SHADER: &str = "
-@group(0) @binding(0) var<uniform> view_projection: mat4x4<f32>;
+struct Camera {
+    view_projection: mat4x4<f32>,
+    view: mat4x4<f32>,
+}
+@group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var<storage, read> tints: array<vec4<f32>, 64>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) color: vec3<f32>,
+    @location(7) normal: vec3<f32>,
     @location(2) model_0: vec4<f32>,
     @location(3) model_1: vec4<f32>,
     @location(4) model_2: vec4<f32>,
@@ -932,15 +951,24 @@ struct VertexOutput {
     @location(0) color: vec4<f32>,
     @location(1) @interpolate(flat) instance: u32,
     @location(2) @interpolate(flat) emissive: vec3<f32>,
+    @location(3) view_normal: vec3<f32>,
+}
+struct GeometryOutput {
+    @location(0) color: vec4<f32>,
+    @location(1) normal: vec4<f32>,
 }
 @vertex fn vs(in: VertexInput, @builtin(instance_index) instance_index: u32) -> VertexOutput {
     let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
-    let clip = view_projection * model * vec4<f32>(in.position, 1.0);
-    return VertexOutput(clip, vec4<f32>(in.color, 1.0), instance_index, in.emissive.rgb);
+    let clip = camera.view_projection * model * vec4<f32>(in.position, 1.0);
+    let view_normal = (camera.view * model * vec4<f32>(in.normal, 0.0)).xyz;
+    return VertexOutput(clip, vec4<f32>(in.color, 1.0), instance_index, in.emissive.rgb, view_normal);
 }
-@fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
+@fragment fn fs(in: VertexOutput) -> GeometryOutput {
     let tint = tints[in.instance % 64u].rgb;
-    return vec4<f32>(in.color.rgb * (tint + in.emissive), 1.0);
+    var out: GeometryOutput;
+    out.color = vec4<f32>(in.color.rgb * (tint + in.emissive), 1.0);
+    out.normal = vec4<f32>(normalize(in.view_normal), 1.0);
+    return out;
 }
 ";
 
@@ -1006,10 +1034,54 @@ const BLUR_SHADER: &str = "
 }
 ";
 
+const SSAO_SHADER: &str = "
+struct Ssao {
+    inverse_projection: mat4x4<f32>,
+    params: vec4<f32>,
+}
+@group(0) @binding(0) var depth_texture: texture_depth_2d;
+@group(0) @binding(1) var normal_texture: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> data: Ssao;
+fn view_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth);
+    let position = data.inverse_projection * vec4<f32>(ndc, 1.0);
+    return position.xyz / position.w;
+}
+@fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
+    let dimensions = vec2<f32>(textureDimensions(depth_texture));
+    let coord = vec2<i32>(in.uv * dimensions);
+    let depth = textureLoad(depth_texture, coord, 0);
+    if (depth <= 0.0) {
+        return vec4<f32>(1.0);
+    }
+    let position = view_position(in.uv, depth);
+    let normal = normalize(textureLoad(normal_texture, coord, 0).xyz);
+    let radius = data.params.x;
+    let bias = data.params.y;
+    let strength = data.params.z;
+    var occlusion = 0.0;
+    for (var index = 0; index < 8; index = index + 1) {
+        let angle = f32(index) / 8.0 * 6.2831853;
+        let sample_coord = coord + vec2<i32>(vec2<f32>(cos(angle), sin(angle)) * radius);
+        let sample_depth = textureLoad(depth_texture, sample_coord, 0);
+        if (sample_depth <= 0.0) {
+            continue;
+        }
+        let sample_uv = (vec2<f32>(sample_coord) + 0.5) / dimensions;
+        let difference = view_position(sample_uv, sample_depth) - position;
+        let range = 1.0 / (1.0 + dot(difference, difference));
+        occlusion += max(dot(normalize(difference), normal) - bias, 0.0) * range;
+    }
+    let ao = clamp(1.0 - occlusion / 8.0 * strength, 0.0, 1.0);
+    return vec4<f32>(vec3<f32>(ao), 1.0);
+}
+";
+
 const COMPOSITE_SHADER: &str = "
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
 @group(0) @binding(1) var scene_sampler: sampler;
 @group(0) @binding(2) var bloom_texture: texture_2d<f32>;
+@group(0) @binding(3) var ao_texture: texture_2d<f32>;
 fn aces(color: vec3<f32>) -> vec3<f32> {
     let a = 2.51;
     let b = 0.03;
@@ -1021,7 +1093,8 @@ fn aces(color: vec3<f32>) -> vec3<f32> {
 @fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
     let scene = textureSample(scene_texture, scene_sampler, in.uv).rgb;
     let bloom = textureSample(bloom_texture, scene_sampler, in.uv).rgb;
-    return vec4<f32>(aces(scene + bloom * 0.8), 1.0);
+    let ao = textureSample(ao_texture, scene_sampler, in.uv).r;
+    return vec4<f32>(aces(scene * ao + bloom * 0.8), 1.0);
 }
 ";
 
@@ -1495,7 +1568,7 @@ struct GeometryPass {
     cube_vertex_buffer: wgpu::Buffer,
     cube_instance_buffer: wgpu::Buffer,
     cube_instance_capacity: u32,
-    view_projection_buffer: wgpu::Buffer,
+    camera_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     tint_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -1528,7 +1601,7 @@ impl PassNode for GeometryPass {
     }
 
     fn color_writes(&self) -> Vec<&'static str> {
-        vec!["color"]
+        vec!["color", "normals"]
     }
 
     fn depth_write(&self) -> Option<&'static str> {
@@ -1538,11 +1611,13 @@ impl PassNode for GeometryPass {
     fn execute(&mut self, context: &mut PassContext) {
         let view_projection = view_projection_matrix(context.world, context.aspect_ratio)
             .unwrap_or_else(Mat4::identity);
-        context.queue.write_buffer(
-            &self.view_projection_buffer,
-            0,
-            bytemuck::cast_slice(view_projection.as_slice()),
-        );
+        let view = camera_view(context.world).unwrap_or_else(Mat4::identity);
+        let mut camera_data = [0.0f32; 32];
+        camera_data[..16].copy_from_slice(view_projection.as_slice());
+        camera_data[16..].copy_from_slice(view.as_slice());
+        context
+            .queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&camera_data));
 
         let models = renderable_models(context.world);
         let triangle_count = models.len() as u32;
@@ -1589,19 +1664,31 @@ impl PassNode for GeometryPass {
             });
 
         let (color_view, color_load, color_store) = color_attachment(context, "color");
+        let (normal_view, normal_load, normal_store) = color_attachment(context, "normals");
         let (depth_view, depth_load, depth_store) = depth_attachment(context, "depth");
         let mut pass = context
             .encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: color_load,
-                        store: color_store,
-                    },
-                })],
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: color_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: color_load,
+                            store: color_store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: normal_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: normal_load,
+                            store: normal_store,
+                        },
+                    }),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: depth_view,
                     depth_ops: Some(wgpu::Operations {
@@ -1709,6 +1796,59 @@ impl PassNode for BlurPass {
     }
 }
 
+struct SsaoPass {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    data_buffer: wgpu::Buffer,
+}
+
+impl PassNode for SsaoPass {
+    fn reads(&self) -> Vec<&'static str> {
+        vec!["depth", "normals"]
+    }
+
+    fn color_writes(&self) -> Vec<&'static str> {
+        vec!["ao"]
+    }
+
+    fn execute(&mut self, context: &mut PassContext) {
+        let projection =
+            camera_projection(context.world, context.aspect_ratio).unwrap_or_else(Mat4::identity);
+        let inverse_projection = projection.try_inverse().unwrap_or_else(Mat4::identity);
+        let mut data = [0.0f32; 20];
+        data[..16].copy_from_slice(inverse_projection.as_slice());
+        data[16..].copy_from_slice(&[24.0, 0.025, 2.5, 0.0]);
+        context
+            .queue
+            .write_buffer(&self.data_buffer, 0, bytemuck::cast_slice(&data));
+
+        let depth_view = read_view(context, "depth");
+        let normal_view = read_view(context, "normals");
+        let bind_group = context
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(normal_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.data_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+        fullscreen_pass(context, &self.pipeline, &bind_group, "ao");
+    }
+}
+
 struct CompositePass {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -1717,7 +1857,7 @@ struct CompositePass {
 
 impl PassNode for CompositePass {
     fn reads(&self) -> Vec<&'static str> {
-        vec!["scene", "bloom"]
+        vec!["scene", "bloom", "ao"]
     }
 
     fn color_writes(&self) -> Vec<&'static str> {
@@ -1727,6 +1867,7 @@ impl PassNode for CompositePass {
     fn execute(&mut self, context: &mut PassContext) {
         let scene_view = read_view(context, "scene");
         let bloom_view = read_view(context, "bloom");
+        let ao_view = read_view(context, "ao");
         let bind_group = context
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1744,6 +1885,10 @@ impl PassNode for CompositePass {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::TextureView(bloom_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(ao_view),
                     },
                 ],
             });
@@ -1906,7 +2051,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         label: None,
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
     });
-    let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+    let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 7 => Float32x3];
     let instance_attrs = wgpu::vertex_attr_array![
         2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4
     ];
@@ -1919,7 +2064,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             compilation_options: Default::default(),
             buffers: &[
                 wgpu::VertexBufferLayout {
-                    array_stride: 24,
+                    array_stride: 36,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &vertex_attrs,
                 },
@@ -1934,7 +2079,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             module: &shader,
             entry_point: Some("fs"),
             compilation_options: Default::default(),
-            targets: &[Some(SCENE_FORMAT.into())],
+            targets: &[Some(SCENE_FORMAT.into()), Some(SCENE_FORMAT.into())],
         }),
         primitive: Default::default(),
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -1993,9 +2138,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         mapped_at_creation: false,
     });
 
-    let view_projection_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 64,
+        size: 128,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -2004,7 +2149,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         layout: &pipeline.get_bind_group_layout(0),
         entries: &[wgpu::BindGroupEntry {
             binding: 0,
-            resource: view_projection_buffer.as_entire_binding(),
+            resource: camera_buffer.as_entire_binding(),
         }],
     });
     let tint_bind_group_layout = pipeline.get_bind_group_layout(1);
@@ -2025,6 +2170,15 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let compute_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let ssao_pipeline = fullscreen_pipeline(&device, SSAO_SHADER, SCENE_FORMAT);
+    let ssao_bind_group_layout = ssao_pipeline.get_bind_group_layout(0);
+    let ssao_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 80,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -2058,6 +2212,8 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let scene = add_color_resource(&mut graph, false, SCENE_FORMAT, background);
     let depth = add_depth_resource(&mut graph, DEPTH_FORMAT, 0.0);
     let tints = add_buffer_resource(&mut graph, TINT_COUNT * 16);
+    let normals = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
+    let ao = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let bright = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let blur_temp = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let bloom = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
@@ -2081,11 +2237,25 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             cube_vertex_buffer,
             cube_instance_buffer,
             cube_instance_capacity: 1,
-            view_projection_buffer,
+            camera_buffer,
             bind_group,
             tint_bind_group_layout,
         }),
-        &[("color", scene), ("depth", depth), ("tints", tints)],
+        &[
+            ("color", scene),
+            ("normals", normals),
+            ("depth", depth),
+            ("tints", tints),
+        ],
+    );
+    add_pass(
+        &mut graph,
+        Box::new(SsaoPass {
+            pipeline: ssao_pipeline,
+            bind_group_layout: ssao_bind_group_layout,
+            data_buffer: ssao_data_buffer,
+        }),
+        &[("depth", depth), ("normals", normals), ("ao", ao)],
     );
     add_pass(
         &mut graph,
@@ -2123,7 +2293,12 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             bind_group_layout: composite_bind_group_layout,
             sampler: linear_sampler(&device),
         }),
-        &[("scene", scene), ("bloom", bloom), ("color", swapchain)],
+        &[
+            ("scene", scene),
+            ("bloom", bloom),
+            ("ao", ao),
+            ("color", swapchain),
+        ],
     );
     render_graph_compile(&mut graph);
 
