@@ -313,6 +313,20 @@ struct Input {
     wheel_delta: f32,
 }
 
+enum InputEvent {
+    Cursor(Vec2),
+    Button(MouseButton, bool),
+    Wheel(f32),
+}
+
+#[derive(Clone, Copy)]
+struct SpawnCommand {
+    mask: u64,
+    transform: LocalTransform,
+    render_mesh: u32,
+    emissive: Vec3,
+}
+
 #[derive(Default)]
 struct Resources {
     delta_time: f32,
@@ -322,6 +336,8 @@ struct Resources {
     timing: Timing,
     transform_state: TransformState,
     input: Input,
+    events: Vec<InputEvent>,
+    commands: Vec<SpawnCommand>,
 }
 
 #[derive(Default)]
@@ -727,6 +743,44 @@ fn spin_system(world: &mut World) {
     }
 }
 
+fn input_system(world: &mut World) {
+    let events = std::mem::take(&mut world.resources.events);
+    let input = &mut world.resources.input;
+    for event in events {
+        match event {
+            InputEvent::Cursor(cursor) => {
+                if input.cursor_initialized {
+                    input.position_delta += cursor - input.cursor;
+                } else {
+                    input.cursor_initialized = true;
+                }
+                input.cursor = cursor;
+            }
+            InputEvent::Button(MouseButton::Left, pressed) => input.left_pressed = pressed,
+            InputEvent::Button(MouseButton::Right, pressed) => input.right_pressed = pressed,
+            InputEvent::Button(_, _) => {}
+            InputEvent::Wheel(delta) => input.wheel_delta += delta,
+        }
+    }
+}
+
+fn process_commands_system(world: &mut World) {
+    let commands = std::mem::take(&mut world.resources.commands);
+    for command in commands {
+        let entity = spawn(world, command.mask);
+        if let Some(local) = get_local_transform_mut(world, entity) {
+            *local = command.transform;
+        }
+        if let Some(render_mesh) = get_render_mesh_mut(world, entity) {
+            render_mesh.0 = command.render_mesh;
+        }
+        if let Some(emissive) = get_emissive_mut(world, entity) {
+            emissive.0 = command.emissive;
+        }
+        mark_local_transform_dirty(world, entity);
+    }
+}
+
 fn camera_y_fov(world: &World, camera: Entity) -> f32 {
     get_camera(world, camera)
         .map(|camera| camera.projection.y_fov_radians)
@@ -936,6 +990,13 @@ impl State for Demo {
             "pan_orbit",
             pan_orbit_camera_system,
         );
+        schedule_insert_before(&mut world.resources.schedule, "spin", "input", input_system);
+        schedule_insert_before(
+            &mut world.resources.schedule,
+            "input",
+            "commands",
+            process_commands_system,
+        );
 
         let camera = spawn(
             world,
@@ -953,45 +1014,38 @@ impl State for Demo {
         let count = 12;
         for index in 0..count {
             let angle = index as f32 / count as f32 * std::f32::consts::TAU;
-            let triangle = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH);
-            if let Some(local) = get_local_transform_mut(world, triangle) {
-                local.translation = nalgebra_glm::vec3(angle.cos() * 3.0, 0.0, angle.sin() * 3.0);
-                local.scale = nalgebra_glm::vec3(0.6, 0.6, 0.6);
-                local.rotation = nalgebra_glm::quat_angle_axis(angle, &Vec3::y());
-            }
-            mark_local_transform_dirty(world, triangle);
+            world.resources.commands.push(SpawnCommand {
+                mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH,
+                transform: LocalTransform {
+                    translation: nalgebra_glm::vec3(angle.cos() * 3.0, 0.0, angle.sin() * 3.0),
+                    rotation: nalgebra_glm::quat_angle_axis(angle, &Vec3::y()),
+                    scale: nalgebra_glm::vec3(0.6, 0.6, 0.6),
+                },
+                render_mesh: 0,
+                emissive: Vec3::zeros(),
+            });
         }
 
-        let cube = spawn(
-            world,
-            LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | EMISSIVE,
-        );
-        if let Some(local) = get_local_transform_mut(world, cube) {
-            local.scale = nalgebra_glm::vec3(0.8, 0.8, 0.8);
-        }
-        if let Some(render_mesh) = get_render_mesh_mut(world, cube) {
-            render_mesh.0 = 1;
-        }
-        if let Some(emissive) = get_emissive_mut(world, cube) {
-            emissive.0 = nalgebra_glm::vec3(4.0, 2.2, 0.8);
-        }
-        mark_local_transform_dirty(world, cube);
+        world.resources.commands.push(SpawnCommand {
+            mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | EMISSIVE,
+            transform: LocalTransform {
+                scale: nalgebra_glm::vec3(0.8, 0.8, 0.8),
+                ..Default::default()
+            },
+            render_mesh: 1,
+            emissive: nalgebra_glm::vec3(4.0, 2.2, 0.8),
+        });
 
-        let ground = spawn(
-            world,
-            LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | EMISSIVE,
-        );
-        if let Some(local) = get_local_transform_mut(world, ground) {
-            local.translation = nalgebra_glm::vec3(0.0, -1.0, 0.0);
-            local.scale = nalgebra_glm::vec3(10.0, 0.1, 10.0);
-        }
-        if let Some(render_mesh) = get_render_mesh_mut(world, ground) {
-            render_mesh.0 = 1;
-        }
-        if let Some(emissive) = get_emissive_mut(world, ground) {
-            emissive.0 = nalgebra_glm::vec3(0.6, 0.6, 0.6);
-        }
-        mark_local_transform_dirty(world, ground);
+        world.resources.commands.push(SpawnCommand {
+            mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | EMISSIVE,
+            transform: LocalTransform {
+                translation: nalgebra_glm::vec3(0.0, -1.0, 0.0),
+                scale: nalgebra_glm::vec3(10.0, 0.1, 10.0),
+                ..Default::default()
+            },
+            render_mesh: 1,
+            emissive: nalgebra_glm::vec3(0.6, 0.6, 0.6),
+        });
     }
 }
 
@@ -2719,29 +2773,23 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
-                match button {
-                    MouseButton::Left => self.world.resources.input.left_pressed = pressed,
-                    MouseButton::Right => self.world.resources.input.right_pressed = pressed,
-                    _ => {}
-                }
+                self.world
+                    .resources
+                    .events
+                    .push(InputEvent::Button(button, pressed));
                 graphics.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = Vec2::new(position.x as f32, position.y as f32);
-                if self.world.resources.input.cursor_initialized {
-                    self.world.resources.input.position_delta +=
-                        cursor - self.world.resources.input.cursor;
-                } else {
-                    self.world.resources.input.cursor_initialized = true;
-                }
-                self.world.resources.input.cursor = cursor;
+                self.world.resources.events.push(InputEvent::Cursor(cursor));
                 graphics.window.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.world.resources.input.wheel_delta += match delta {
+                let amount = match delta {
                     MouseScrollDelta::LineDelta(_, vertical) => vertical,
                     MouseScrollDelta::PixelDelta(position) => position.y as f32 / 120.0,
                 };
+                self.world.resources.events.push(InputEvent::Wheel(amount));
                 graphics.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
