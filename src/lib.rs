@@ -884,32 +884,7 @@ struct VertexOutput {
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-struct PassContext<'a> {
-    device: &'a wgpu::Device,
-    queue: &'a wgpu::Queue,
-    encoder: &'a mut wgpu::CommandEncoder,
-    color_view: &'a wgpu::TextureView,
-    depth_view: &'a wgpu::TextureView,
-    world: &'a World,
-    aspect_ratio: f32,
-}
-
-trait PassNode {
-    fn execute(&mut self, context: &mut PassContext);
-}
-
-#[derive(Default)]
-struct RenderGraph {
-    passes: Vec<Box<dyn PassNode>>,
-}
-
-fn render_graph_execute(graph: &mut RenderGraph, context: &mut PassContext) {
-    for pass in graph.passes.iter_mut() {
-        pass.execute(context);
-    }
-}
-
-struct TrianglePass {
+struct TriangleResources {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
@@ -918,73 +893,101 @@ struct TrianglePass {
     bind_group: wgpu::BindGroup,
 }
 
-impl PassNode for TrianglePass {
-    fn execute(&mut self, context: &mut PassContext) {
-        let view_projection = view_projection_matrix(context.world, context.aspect_ratio)
-            .unwrap_or_else(Mat4::identity);
+struct RenderResources {
+    triangle: TriangleResources,
+}
+
+struct PassContext<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    encoder: &'a mut wgpu::CommandEncoder,
+    color_view: &'a wgpu::TextureView,
+    depth_view: &'a wgpu::TextureView,
+    world: &'a World,
+    aspect_ratio: f32,
+    resources: &'a mut RenderResources,
+}
+
+type Pass = fn(&mut PassContext);
+
+#[derive(Default)]
+struct RenderGraph {
+    passes: Vec<(&'static str, Pass)>,
+}
+
+fn render_graph_execute(graph: &RenderGraph, context: &mut PassContext) {
+    for (_, pass) in &graph.passes {
+        pass(context);
+    }
+}
+
+fn triangle_pass(context: &mut PassContext) {
+    let view_projection =
+        view_projection_matrix(context.world, context.aspect_ratio).unwrap_or_else(Mat4::identity);
+    context.queue.write_buffer(
+        &context.resources.triangle.view_projection_buffer,
+        0,
+        bytemuck::cast_slice(view_projection.as_slice()),
+    );
+
+    let models = renderable_models(context.world);
+    let instance_count = models.len() as u32;
+
+    let triangle = &mut context.resources.triangle;
+    if instance_count > triangle.instance_capacity {
+        triangle.instance_capacity = instance_count.next_power_of_two();
+        triangle.instance_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: triangle.instance_capacity as u64 * 64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+    if instance_count > 0 {
+        let mut instance_data: Vec<f32> = Vec::with_capacity(models.len() * 16);
+        for model in &models {
+            instance_data.extend_from_slice(model.as_slice());
+        }
         context.queue.write_buffer(
-            &self.view_projection_buffer,
+            &triangle.instance_buffer,
             0,
-            bytemuck::cast_slice(view_projection.as_slice()),
+            bytemuck::cast_slice(&instance_data),
         );
+    }
 
-        let models = renderable_models(context.world);
-        let instance_count = models.len() as u32;
-        if instance_count > self.instance_capacity {
-            self.instance_capacity = instance_count.next_power_of_two();
-            self.instance_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: self.instance_capacity as u64 * 64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        if instance_count > 0 {
-            let mut instance_data: Vec<f32> = Vec::with_capacity(models.len() * 16);
-            for model in &models {
-                instance_data.extend_from_slice(model.as_slice());
-            }
-            context.queue.write_buffer(
-                &self.instance_buffer,
-                0,
-                bytemuck::cast_slice(&instance_data),
-            );
-        }
-
-        let mut pass = context
-            .encoder
-            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: context.color_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.05,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: context.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0.0),
-                        store: wgpu::StoreOp::Store,
+    let mut pass = context
+        .encoder
+        .begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: context.color_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.02,
+                        g: 0.02,
+                        b: 0.05,
+                        a: 1.0,
                     }),
-                    stencil_ops: None,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: context.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0),
+                    store: wgpu::StoreOp::Store,
                 }),
-                ..Default::default()
-            });
-        if instance_count > 0 {
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            pass.draw(0..3, 0..instance_count);
-        }
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+    if instance_count > 0 {
+        pass.set_pipeline(&triangle.pipeline);
+        pass.set_bind_group(0, &triangle.bind_group, &[]);
+        pass.set_vertex_buffer(0, triangle.vertex_buffer.slice(..));
+        pass.set_vertex_buffer(1, triangle.instance_buffer.slice(..));
+        pass.draw(0..3, 0..instance_count);
     }
 }
 
@@ -1010,6 +1013,7 @@ struct Graphics {
     egui_renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
     graph: RenderGraph,
+    render_resources: RenderResources,
     size: (u32, u32),
 }
 
@@ -1156,15 +1160,18 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         None,
     );
 
-    let graph = RenderGraph {
-        passes: vec![Box::new(TrianglePass {
+    let render_resources = RenderResources {
+        triangle: TriangleResources {
             pipeline,
             vertex_buffer,
             instance_buffer,
             instance_capacity: 1,
             view_projection_buffer,
             bind_group,
-        })],
+        },
+    };
+    let graph = RenderGraph {
+        passes: vec![("triangle", triangle_pass)],
     };
 
     Graphics {
@@ -1177,6 +1184,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         egui_renderer,
         egui_state,
         graph,
+        render_resources,
         size: (width, height),
     }
 }
@@ -1283,8 +1291,9 @@ fn render(graphics: &mut Graphics, world: &World) {
             depth_view: &graphics.depth_view,
             world,
             aspect_ratio,
+            resources: &mut graphics.render_resources,
         };
-        render_graph_execute(&mut graphics.graph, &mut context);
+        render_graph_execute(&graphics.graph, &mut context);
     }
 
     {
