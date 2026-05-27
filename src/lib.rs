@@ -1132,6 +1132,38 @@ fn view_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 }
 ";
 
+const SSAO_BLUR_SHADER: &str = "
+@group(0) @binding(0) var ao_texture: texture_2d<f32>;
+@group(0) @binding(1) var depth_texture: texture_depth_2d;
+@group(0) @binding(2) var normal_texture: texture_2d<f32>;
+@fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
+    let coord = vec2<i32>(in.uv * vec2<f32>(textureDimensions(ao_texture)));
+    let center_depth = textureLoad(depth_texture, coord, 0);
+    if (center_depth <= 0.0) {
+        return vec4<f32>(1.0);
+    }
+    let center_normal = normalize(textureLoad(normal_texture, coord, 0).xyz);
+    var total = 0.0;
+    var weight_total = 0.0;
+    for (var y = -2; y <= 2; y = y + 1) {
+        for (var x = -2; x <= 2; x = x + 1) {
+            let sample_coord = coord + vec2<i32>(x, y);
+            let sample_depth = textureLoad(depth_texture, sample_coord, 0);
+            if (sample_depth <= 0.0) {
+                continue;
+            }
+            let sample_normal = normalize(textureLoad(normal_texture, sample_coord, 0).xyz);
+            let depth_weight = exp(-abs(sample_depth - center_depth) * 200.0);
+            let normal_weight = pow(max(dot(sample_normal, center_normal), 0.0), 8.0);
+            let weight = depth_weight * normal_weight;
+            total += textureLoad(ao_texture, sample_coord, 0).r * weight;
+            weight_total += weight;
+        }
+    }
+    return vec4<f32>(vec3<f32>(total / max(weight_total, 0.0001)), 1.0);
+}
+";
+
 const COMPOSITE_SHADER: &str = "
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
 @group(0) @binding(1) var scene_sampler: sampler;
@@ -1863,7 +1895,7 @@ impl PassNode for SsaoPass {
     }
 
     fn color_writes(&self) -> Vec<&'static str> {
-        vec!["ao"]
+        vec!["ao_raw"]
     }
 
     fn execute(&mut self, context: &mut PassContext) {
@@ -1896,6 +1928,49 @@ impl PassNode for SsaoPass {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: self.data_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+        fullscreen_pass(context, &self.pipeline, &bind_group, "ao_raw");
+    }
+}
+
+struct SsaoBlurPass {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl PassNode for SsaoBlurPass {
+    fn reads(&self) -> Vec<&'static str> {
+        vec!["ao_raw", "depth", "normals"]
+    }
+
+    fn color_writes(&self) -> Vec<&'static str> {
+        vec!["ao"]
+    }
+
+    fn execute(&mut self, context: &mut PassContext) {
+        let ao_view = read_view(context, "ao_raw");
+        let depth_view = read_view(context, "depth");
+        let normal_view = read_view(context, "normals");
+        let bind_group = context
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(ao_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(normal_view),
                     },
                 ],
             });
@@ -2256,6 +2331,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         mapped_at_creation: false,
     });
 
+    let ssao_blur_pipeline = fullscreen_pipeline(&device, SSAO_BLUR_SHADER, SCENE_FORMAT);
+    let ssao_blur_bind_group_layout = ssao_blur_pipeline.get_bind_group_layout(0);
+
     let egui_renderer = egui_wgpu::Renderer::new(
         &device,
         surface_config.format,
@@ -2286,6 +2364,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let depth = add_depth_resource(&mut graph, DEPTH_FORMAT, 0.0);
     let tints = add_buffer_resource(&mut graph, TINT_COUNT * 16);
     let normals = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
+    let ao_raw = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let ao = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let bright = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let blur_temp = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
@@ -2328,7 +2407,20 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             bind_group_layout: ssao_bind_group_layout,
             data_buffer: ssao_data_buffer,
         }),
-        &[("depth", depth), ("normals", normals), ("ao", ao)],
+        &[("depth", depth), ("normals", normals), ("ao_raw", ao_raw)],
+    );
+    add_pass(
+        &mut graph,
+        Box::new(SsaoBlurPass {
+            pipeline: ssao_blur_pipeline,
+            bind_group_layout: ssao_blur_bind_group_layout,
+        }),
+        &[
+            ("ao_raw", ao_raw),
+            ("depth", depth),
+            ("normals", normals),
+            ("ao", ao),
+        ],
     );
     add_pass(
         &mut graph,
