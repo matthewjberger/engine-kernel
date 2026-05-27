@@ -873,13 +873,48 @@ struct VertexOutput {
 }
 ";
 
+const TONEMAP_SHADER: &str = "
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+@vertex fn vs(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    let x = f32((vertex_index & 1u) << 1u);
+    let y = f32(vertex_index & 2u);
+    var out: VertexOutput;
+    out.position = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    out.uv = vec2<f32>(x, y);
+    return out;
+}
+@group(0) @binding(0) var scene_texture: texture_2d<f32>;
+@group(0) @binding(1) var scene_sampler: sampler;
+fn aces(color: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+@fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(scene_texture, scene_sampler, in.uv).rgb;
+    return vec4<f32>(aces(color), 1.0);
+}
+";
+
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+#[derive(Clone, Copy)]
+enum Clear {
+    Color(wgpu::Color),
+    Depth(f32),
+}
 
 struct ResourceDesc {
     external: bool,
     format: wgpu::TextureFormat,
-    clear_color: wgpu::Color,
-    clear_depth: f32,
+    clear: Clear,
 }
 
 struct GraphPass {
@@ -893,7 +928,10 @@ struct RenderGraph {
     passes: Vec<GraphPass>,
     execution_order: Vec<usize>,
     clears: HashSet<(usize, usize)>,
-    transient_views: Vec<Option<wgpu::TextureView>>,
+    stores: HashSet<(usize, usize)>,
+    resource_physical: Vec<Option<usize>>,
+    physical_formats: Vec<wgpu::TextureFormat>,
+    physical_views: Vec<wgpu::TextureView>,
     size: (u32, u32),
 }
 
@@ -907,6 +945,7 @@ struct PassContext<'a> {
     views: &'a [Option<&'a wgpu::TextureView>],
     bindings: &'a HashMap<&'static str, usize>,
     clears: &'a HashSet<(usize, usize)>,
+    stores: &'a HashSet<(usize, usize)>,
     pass_index: usize,
 }
 
@@ -914,10 +953,19 @@ trait PassNode {
     fn reads(&self) -> Vec<&'static str> {
         Vec::new()
     }
-    fn writes(&self) -> Vec<&'static str> {
+    fn color_writes(&self) -> Vec<&'static str> {
         Vec::new()
     }
+    fn depth_write(&self) -> Option<&'static str> {
+        None
+    }
     fn execute(&mut self, context: &mut PassContext);
+}
+
+fn write_slots(node: &dyn PassNode) -> Vec<&'static str> {
+    let mut slots = node.color_writes();
+    slots.extend(node.depth_write());
+    slots
 }
 
 fn add_color_resource(
@@ -929,8 +977,7 @@ fn add_color_resource(
     graph.resources.push(ResourceDesc {
         external,
         format,
-        clear_color,
-        clear_depth: 0.0,
+        clear: Clear::Color(clear_color),
     });
     graph.resources.len() - 1
 }
@@ -943,8 +990,7 @@ fn add_depth_resource(
     graph.resources.push(ResourceDesc {
         external: false,
         format,
-        clear_color: wgpu::Color::BLACK,
-        clear_depth,
+        clear: Clear::Depth(clear_depth),
     });
     graph.resources.len() - 1
 }
@@ -956,7 +1002,7 @@ fn add_pass(graph: &mut RenderGraph, node: Box<dyn PassNode>, bindings: &[(&'sta
     });
 }
 
-fn pass_resource_ids(pass: &GraphPass, slots: Vec<&'static str>) -> Vec<usize> {
+fn binding_resources(pass: &GraphPass, slots: &[&'static str]) -> Vec<usize> {
     slots
         .iter()
         .filter_map(|slot| pass.bindings.get(slot).copied())
@@ -964,37 +1010,68 @@ fn pass_resource_ids(pass: &GraphPass, slots: Vec<&'static str>) -> Vec<usize> {
 }
 
 fn render_graph_compile(graph: &mut RenderGraph) {
-    let reads_writes: Vec<(Vec<usize>, Vec<usize>)> = graph
+    let pass_count = graph.passes.len();
+    let resource_count = graph.resources.len();
+    let reads: Vec<Vec<usize>> = graph
         .passes
         .iter()
-        .map(|pass| {
-            (
-                pass_resource_ids(pass, pass.node.reads()),
-                pass_resource_ids(pass, pass.node.writes()),
-            )
-        })
+        .map(|pass| binding_resources(pass, &pass.node.reads()))
+        .collect();
+    let writes: Vec<Vec<usize>> = graph
+        .passes
+        .iter()
+        .map(|pass| binding_resources(pass, &write_slots(pass.node.as_ref())))
         .collect();
 
-    let pass_count = reads_writes.len();
-    let mut adjacency = vec![Vec::new(); pass_count];
-    let mut indegree = vec![0usize; pass_count];
+    let mut edges = Vec::new();
     let mut last_writer: HashMap<usize, usize> = HashMap::new();
-    for (index, (reads, writes)) in reads_writes.iter().enumerate() {
-        for resource in reads.iter().chain(writes.iter()) {
+    for index in 0..pass_count {
+        for resource in reads[index].iter().chain(writes[index].iter()) {
             if let Some(&writer) = last_writer.get(resource)
                 && writer != index
             {
-                adjacency[writer].push(index);
-                indegree[index] += 1;
+                edges.push((writer, index));
             }
         }
-        for resource in writes {
+        for resource in &writes[index] {
             last_writer.insert(*resource, index);
         }
     }
 
+    let mut incoming = vec![Vec::new(); pass_count];
+    for &(from, to) in &edges {
+        incoming[to].push(from);
+    }
+    let mut keep = vec![false; pass_count];
+    let mut frontier: Vec<usize> = (0..pass_count)
+        .filter(|&index| {
+            writes[index]
+                .iter()
+                .any(|&resource| graph.resources[resource].external)
+        })
+        .collect();
+    for &seed in &frontier {
+        keep[seed] = true;
+    }
+    while let Some(node) = frontier.pop() {
+        for &producer in &incoming[node] {
+            if !keep[producer] {
+                keep[producer] = true;
+                frontier.push(producer);
+            }
+        }
+    }
+
+    let mut adjacency = vec![Vec::new(); pass_count];
+    let mut indegree = vec![0usize; pass_count];
+    for &(from, to) in &edges {
+        if keep[from] && keep[to] {
+            adjacency[from].push(to);
+            indegree[to] += 1;
+        }
+    }
     let mut ready: Vec<usize> = (0..pass_count)
-        .filter(|&index| indegree[index] == 0)
+        .filter(|&index| keep[index] && indegree[index] == 0)
         .collect();
     let mut order = Vec::with_capacity(pass_count);
     let mut cursor = 0;
@@ -1013,44 +1090,118 @@ fn render_graph_compile(graph: &mut RenderGraph) {
     let mut cleared = HashSet::new();
     graph.clears.clear();
     for &index in &order {
-        for &resource in &reads_writes[index].1 {
+        for &resource in &writes[index] {
             if cleared.insert(resource) {
                 graph.clears.insert((index, resource));
             }
         }
     }
+
+    graph.stores.clear();
+    for resource in 0..resource_count {
+        let mut producer: Option<usize> = None;
+        for &index in &order {
+            if reads[index].contains(&resource)
+                && let Some(writer) = producer
+            {
+                graph.stores.insert((writer, resource));
+            }
+            if writes[index].contains(&resource) {
+                producer = Some(index);
+            }
+        }
+        if graph.resources[resource].external
+            && let Some(writer) = producer
+        {
+            graph.stores.insert((writer, resource));
+        }
+    }
+
+    let mut first_use = vec![usize::MAX; resource_count];
+    let mut last_use = vec![0usize; resource_count];
+    let mut used = vec![false; resource_count];
+    for (position, &index) in order.iter().enumerate() {
+        for &resource in reads[index].iter().chain(writes[index].iter()) {
+            used[resource] = true;
+            first_use[resource] = first_use[resource].min(position);
+            last_use[resource] = last_use[resource].max(position);
+        }
+    }
+
+    let mut transient: Vec<usize> = (0..resource_count)
+        .filter(|&resource| used[resource] && !graph.resources[resource].external)
+        .collect();
+    transient.sort_by_key(|&resource| first_use[resource]);
+
+    let mut resource_physical = vec![None; resource_count];
+    let mut physical_formats: Vec<wgpu::TextureFormat> = Vec::new();
+    let mut physical_last_use: Vec<usize> = Vec::new();
+    for resource in transient {
+        let format = graph.resources[resource].format;
+        let reused = (0..physical_formats.len()).find(|&slot| {
+            physical_formats[slot] == format && physical_last_use[slot] < first_use[resource]
+        });
+        let slot = match reused {
+            Some(slot) => {
+                physical_last_use[slot] = last_use[resource];
+                slot
+            }
+            None => {
+                physical_formats.push(format);
+                physical_last_use.push(last_use[resource]);
+                physical_formats.len() - 1
+            }
+        };
+        resource_physical[resource] = Some(slot);
+    }
+
+    graph.resource_physical = resource_physical;
+    graph.physical_formats = physical_formats;
+    graph.physical_views.clear();
+    graph.size = (0, 0);
     graph.execution_order = order;
 }
 
-fn ensure_transient_textures(graph: &mut RenderGraph, device: &wgpu::Device, size: (u32, u32)) {
-    if graph.size == size && !graph.transient_views.is_empty() {
+fn ensure_physical_textures(graph: &mut RenderGraph, device: &wgpu::Device, size: (u32, u32)) {
+    if graph.size == size && graph.physical_views.len() == graph.physical_formats.len() {
         return;
     }
-    graph.transient_views = graph
-        .resources
+    graph.physical_views = graph
+        .physical_formats
         .iter()
-        .map(|resource| {
-            (!resource.external).then(|| {
-                let texture = device.create_texture(&wgpu::TextureDescriptor {
-                    label: None,
-                    size: wgpu::Extent3d {
-                        width: size.0.max(1),
-                        height: size.1.max(1),
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: resource.format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                });
-                texture.create_view(&Default::default())
-            })
+        .map(|&format| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: size.0.max(1),
+                    height: size.1.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            texture.create_view(&Default::default())
         })
         .collect();
     graph.size = size;
+}
+
+fn store_op(context: &PassContext, resource: usize) -> wgpu::StoreOp {
+    if context.stores.contains(&(context.pass_index, resource)) {
+        wgpu::StoreOp::Store
+    } else {
+        wgpu::StoreOp::Discard
+    }
+}
+
+fn read_view<'a>(context: &PassContext<'a>, slot: &str) -> &'a wgpu::TextureView {
+    let resource = context.bindings[slot];
+    context.views[resource].expect("unbound read resource")
 }
 
 fn color_attachment<'a>(
@@ -1063,12 +1214,14 @@ fn color_attachment<'a>(
 ) {
     let resource = context.bindings[slot];
     let view = context.views[resource].expect("unbound color attachment");
-    let load = if context.clears.contains(&(context.pass_index, resource)) {
-        wgpu::LoadOp::Clear(context.resources[resource].clear_color)
-    } else {
-        wgpu::LoadOp::Load
+    let load = match (
+        context.clears.contains(&(context.pass_index, resource)),
+        context.resources[resource].clear,
+    ) {
+        (true, Clear::Color(color)) => wgpu::LoadOp::Clear(color),
+        _ => wgpu::LoadOp::Load,
     };
-    (view, load, wgpu::StoreOp::Store)
+    (view, load, store_op(context, resource))
 }
 
 fn depth_attachment<'a>(
@@ -1077,12 +1230,14 @@ fn depth_attachment<'a>(
 ) -> (&'a wgpu::TextureView, wgpu::LoadOp<f32>, wgpu::StoreOp) {
     let resource = context.bindings[slot];
     let view = context.views[resource].expect("unbound depth attachment");
-    let load = if context.clears.contains(&(context.pass_index, resource)) {
-        wgpu::LoadOp::Clear(context.resources[resource].clear_depth)
-    } else {
-        wgpu::LoadOp::Load
+    let load = match (
+        context.clears.contains(&(context.pass_index, resource)),
+        context.resources[resource].clear,
+    ) {
+        (true, Clear::Depth(depth)) => wgpu::LoadOp::Clear(depth),
+        _ => wgpu::LoadOp::Load,
     };
-    (view, load, wgpu::StoreOp::Store)
+    (view, load, store_op(context, resource))
 }
 
 fn render_graph_execute(
@@ -1094,7 +1249,7 @@ fn render_graph_execute(
     external: &wgpu::TextureView,
     size: (u32, u32),
 ) -> wgpu::CommandBuffer {
-    ensure_transient_textures(graph, device, size);
+    ensure_physical_textures(graph, device, size);
 
     let views: Vec<Option<&wgpu::TextureView>> = graph
         .resources
@@ -1104,7 +1259,7 @@ fn render_graph_execute(
             if resource.external {
                 Some(external)
             } else {
-                graph.transient_views[id].as_ref()
+                graph.resource_physical[id].map(|slot| &graph.physical_views[slot])
             }
         })
         .collect();
@@ -1122,6 +1277,7 @@ fn render_graph_execute(
             views: &views,
             bindings: &bindings,
             clears: &graph.clears,
+            stores: &graph.stores,
             pass_index: index,
         };
         graph.passes[index].node.execute(&mut context);
@@ -1139,8 +1295,12 @@ struct TrianglePass {
 }
 
 impl PassNode for TrianglePass {
-    fn writes(&self) -> Vec<&'static str> {
-        vec!["color", "depth"]
+    fn color_writes(&self) -> Vec<&'static str> {
+        vec!["color"]
+    }
+
+    fn depth_write(&self) -> Option<&'static str> {
+        Some("depth")
     }
 
     fn execute(&mut self, context: &mut PassContext) {
@@ -1206,6 +1366,62 @@ impl PassNode for TrianglePass {
             pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             pass.draw(0..3, 0..instance_count);
         }
+    }
+}
+
+struct TonemapPass {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+impl PassNode for TonemapPass {
+    fn reads(&self) -> Vec<&'static str> {
+        vec!["scene"]
+    }
+
+    fn color_writes(&self) -> Vec<&'static str> {
+        vec!["color"]
+    }
+
+    fn execute(&mut self, context: &mut PassContext) {
+        let scene_view = read_view(context, "scene");
+        let bind_group = context
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(scene_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+
+        let (color_view, color_load, color_store) = color_attachment(context, "color");
+        let mut pass = context
+            .encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: color_load,
+                        store: color_store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
@@ -1293,7 +1509,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             module: &shader,
             entry_point: Some("fs"),
             compilation_options: Default::default(),
-            targets: &[Some(surface_config.format.into())],
+            targets: &[Some(SCENE_FORMAT.into())],
         }),
         primitive: Default::default(),
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -1306,6 +1522,38 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         multisample: Default::default(),
         multiview_mask: None,
         cache: None,
+    });
+
+    let tonemap_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(TONEMAP_SHADER.into()),
+    });
+    let tonemap_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &tonemap_shader,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &tonemap_shader,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(surface_config.format.into())],
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let tonemap_bind_group_layout = tonemap_pipeline.get_bind_group_layout(0);
+    let tonemap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
     });
 
     let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1357,17 +1605,14 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     );
 
     let mut graph = RenderGraph::default();
-    let swapchain = add_color_resource(
-        &mut graph,
-        true,
-        surface_config.format,
-        wgpu::Color {
-            r: 0.02,
-            g: 0.02,
-            b: 0.05,
-            a: 1.0,
-        },
-    );
+    let background = wgpu::Color {
+        r: 0.02,
+        g: 0.02,
+        b: 0.05,
+        a: 1.0,
+    };
+    let swapchain = add_color_resource(&mut graph, true, surface_config.format, background);
+    let scene = add_color_resource(&mut graph, false, SCENE_FORMAT, background);
     let depth = add_depth_resource(&mut graph, DEPTH_FORMAT, 0.0);
     add_pass(
         &mut graph,
@@ -1379,7 +1624,16 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             view_projection_buffer,
             bind_group,
         }),
-        &[("color", swapchain), ("depth", depth)],
+        &[("color", scene), ("depth", depth)],
+    );
+    add_pass(
+        &mut graph,
+        Box::new(TonemapPass {
+            pipeline: tonemap_pipeline,
+            bind_group_layout: tonemap_bind_group_layout,
+            sampler: tonemap_sampler,
+        }),
+        &[("scene", scene), ("color", swapchain)],
     );
     render_graph_compile(&mut graph);
 
