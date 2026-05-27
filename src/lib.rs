@@ -75,7 +75,7 @@ struct Parent(Option<Entity>);
 struct LocalTransformDirty;
 
 #[derive(Clone, Copy, Default)]
-struct Mesh;
+struct RenderMesh(u32);
 
 #[derive(Clone, Copy, Default)]
 struct Emissive(Vec3);
@@ -242,7 +242,7 @@ components!(
     LOCAL_TRANSFORM_DIRTY => LocalTransformDirty, local_transform_dirty;
     CAMERA                => Camera,              cameras;
     PAN_ORBIT_CAMERA      => PanOrbitCamera,      pan_orbit_cameras;
-    MESH                  => Mesh,                meshes;
+    RENDER_MESH           => RenderMesh,          render_meshes;
     EMISSIVE              => Emissive,            emissives;
 );
 
@@ -583,6 +583,13 @@ fn get_emissive_mut(world: &mut World, entity: Entity) -> Option<&mut Emissive> 
     })
 }
 
+fn get_render_mesh_mut(world: &mut World, entity: Entity) -> Option<&mut RenderMesh> {
+    component_mut(world, entity, RENDER_MESH, |table, row, tick| {
+        table.render_meshes[row].1 = tick;
+        &mut table.render_meshes[row].0
+    })
+}
+
 fn collect_entities(world: &mut World, mask: u64) -> Vec<Entity> {
     let mut entities = Vec::new();
     for table in query_tables(world, mask).to_vec() {
@@ -695,7 +702,10 @@ const SPIN_SPEED: f32 = 0.8;
 
 fn spin_system(world: &mut World) {
     let delta_time = world.delta_time;
-    for entity in collect_entities(world, MESH) {
+    for entity in collect_entities(world, RENDER_MESH) {
+        if entity_has(world, entity, EMISSIVE) {
+            continue;
+        }
         if let Some(local) = get_local_transform_mut(world, entity) {
             let spin = nalgebra_glm::quat_angle_axis(SPIN_SPEED * delta_time, &Vec3::y());
             local.rotation = spin * local.rotation;
@@ -843,30 +853,27 @@ fn view_projection_matrix(world: &World, aspect_ratio: f32) -> Option<Mat4> {
     Some(camera_projection(world, aspect_ratio)? * camera_view(world)?)
 }
 
-fn renderable_models(world: &World) -> Vec<Mat4> {
-    let mut models = Vec::new();
+fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3)> {
+    let mut instances = Vec::new();
     for table in &world.tables {
-        if table.mask & (MESH | GLOBAL_TRANSFORM) != (MESH | GLOBAL_TRANSFORM) {
+        if table.mask & (RENDER_MESH | GLOBAL_TRANSFORM) != (RENDER_MESH | GLOBAL_TRANSFORM) {
             continue;
         }
-        for entry in &table.global_transforms {
-            models.push(entry.0.0);
+        let emissive_table = table.mask & EMISSIVE != 0;
+        for row in 0..table.entities.len() {
+            if table.render_meshes[row].0.0 != handle {
+                continue;
+            }
+            let model = table.global_transforms[row].0.0;
+            let emissive = if emissive_table {
+                table.emissives[row].0.0
+            } else {
+                Vec3::zeros()
+            };
+            instances.push((model, emissive));
         }
     }
-    models
-}
-
-fn emissive_cubes(world: &World) -> Vec<(Mat4, Vec3)> {
-    let mut cubes = Vec::new();
-    for table in &world.tables {
-        if table.mask & (EMISSIVE | GLOBAL_TRANSFORM) != (EMISSIVE | GLOBAL_TRANSFORM) {
-            continue;
-        }
-        for (transform, emissive) in table.global_transforms.iter().zip(table.emissives.iter()) {
-            cubes.push((transform.0.0, emissive.0.0));
-        }
-    }
-    cubes
+    instances
 }
 
 fn timing_system(world: &mut World) {
@@ -924,7 +931,7 @@ impl State for Demo {
         let count = 12;
         for index in 0..count {
             let angle = index as f32 / count as f32 * std::f32::consts::TAU;
-            let triangle = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | MESH);
+            let triangle = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH);
             if let Some(local) = get_local_transform_mut(world, triangle) {
                 local.translation = nalgebra_glm::vec3(angle.cos() * 3.0, 0.0, angle.sin() * 3.0);
                 local.scale = nalgebra_glm::vec3(0.6, 0.6, 0.6);
@@ -933,19 +940,31 @@ impl State for Demo {
             mark_local_transform_dirty(world, triangle);
         }
 
-        let cube = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | EMISSIVE);
+        let cube = spawn(
+            world,
+            LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | EMISSIVE,
+        );
         if let Some(local) = get_local_transform_mut(world, cube) {
             local.scale = nalgebra_glm::vec3(0.8, 0.8, 0.8);
+        }
+        if let Some(render_mesh) = get_render_mesh_mut(world, cube) {
+            render_mesh.0 = 1;
         }
         if let Some(emissive) = get_emissive_mut(world, cube) {
             emissive.0 = nalgebra_glm::vec3(4.0, 2.2, 0.8);
         }
         mark_local_transform_dirty(world, cube);
 
-        let ground = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | EMISSIVE);
+        let ground = spawn(
+            world,
+            LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | EMISSIVE,
+        );
         if let Some(local) = get_local_transform_mut(world, ground) {
             local.translation = nalgebra_glm::vec3(0.0, -1.0, 0.0);
             local.scale = nalgebra_glm::vec3(10.0, 0.1, 10.0);
+        }
+        if let Some(render_mesh) = get_render_mesh_mut(world, ground) {
+            render_mesh.0 = 1;
         }
         if let Some(emissive) = get_emissive_mut(world, ground) {
             emissive.0 = nalgebra_glm::vec3(0.6, 0.6, 0.6);
@@ -1647,14 +1666,16 @@ fn render_graph_execute(
     encoder.finish()
 }
 
+struct MeshGpu {
+    vertex_buffer: wgpu::Buffer,
+    vertex_count: u32,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: u32,
+}
+
 struct GeometryPass {
     pipeline: wgpu::RenderPipeline,
-    triangle_vertex_buffer: wgpu::Buffer,
-    triangle_instance_buffer: wgpu::Buffer,
-    triangle_instance_capacity: u32,
-    cube_vertex_buffer: wgpu::Buffer,
-    cube_instance_buffer: wgpu::Buffer,
-    cube_instance_capacity: u32,
+    meshes: Vec<MeshGpu>,
     camera_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     tint_bind_group_layout: wgpu::BindGroupLayout,
@@ -1682,6 +1703,28 @@ fn upload_instances(
     }
 }
 
+fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> MeshGpu {
+    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: std::mem::size_of_val(vertices) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
+    let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 80,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    MeshGpu {
+        vertex_buffer,
+        vertex_count: vertices.len() as u32 / 9,
+        instance_buffer,
+        instance_capacity: 1,
+    }
+}
+
 impl PassNode for GeometryPass {
     fn reads(&self) -> Vec<&'static str> {
         vec!["tints"]
@@ -1706,37 +1749,25 @@ impl PassNode for GeometryPass {
             .queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&camera_data));
 
-        let models = renderable_models(context.world);
-        let triangle_count = models.len() as u32;
-        let mut triangle_data: Vec<f32> = Vec::with_capacity(models.len() * 20);
-        for model in &models {
-            triangle_data.extend_from_slice(model.as_slice());
-            triangle_data.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+        let mut counts = Vec::with_capacity(self.meshes.len());
+        for (handle, mesh) in self.meshes.iter_mut().enumerate() {
+            let instances = mesh_instances(context.world, handle as u32);
+            let count = instances.len() as u32;
+            let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 20);
+            for (model, emissive) in &instances {
+                data.extend_from_slice(model.as_slice());
+                data.extend_from_slice(&[emissive.x, emissive.y, emissive.z, 0.0]);
+            }
+            upload_instances(
+                context.device,
+                context.queue,
+                &mut mesh.instance_buffer,
+                &mut mesh.instance_capacity,
+                &data,
+                count,
+            );
+            counts.push(count);
         }
-        upload_instances(
-            context.device,
-            context.queue,
-            &mut self.triangle_instance_buffer,
-            &mut self.triangle_instance_capacity,
-            &triangle_data,
-            triangle_count,
-        );
-
-        let cubes = emissive_cubes(context.world);
-        let cube_count = cubes.len() as u32;
-        let mut cube_data: Vec<f32> = Vec::with_capacity(cubes.len() * 20);
-        for (model, emissive) in &cubes {
-            cube_data.extend_from_slice(model.as_slice());
-            cube_data.extend_from_slice(&[emissive.x, emissive.y, emissive.z, 0.0]);
-        }
-        upload_instances(
-            context.device,
-            context.queue,
-            &mut self.cube_instance_buffer,
-            &mut self.cube_instance_capacity,
-            &cube_data,
-            cube_count,
-        );
 
         let tints = graph_buffer(context, "tints");
         let tint_bind_group = context
@@ -1789,15 +1820,12 @@ impl PassNode for GeometryPass {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_bind_group(1, &tint_bind_group, &[]);
-        if triangle_count > 0 {
-            pass.set_vertex_buffer(0, self.triangle_vertex_buffer.slice(..));
-            pass.set_vertex_buffer(1, self.triangle_instance_buffer.slice(..));
-            pass.draw(0..3, 0..triangle_count);
-        }
-        if cube_count > 0 {
-            pass.set_vertex_buffer(0, self.cube_vertex_buffer.slice(..));
-            pass.set_vertex_buffer(1, self.cube_instance_buffer.slice(..));
-            pass.draw(0..36, 0..cube_count);
+        for (handle, mesh) in self.meshes.iter().enumerate() {
+            if counts[handle] > 0 {
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
+                pass.draw(0..mesh.vertex_count, 0..counts[handle]);
+            }
         }
     }
 }
@@ -2253,38 +2281,10 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let composite_pipeline = fullscreen_pipeline(&device, COMPOSITE_SHADER, surface_config.format);
     let composite_bind_group_layout = composite_pipeline.get_bind_group_layout(0);
 
-    let triangle_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: std::mem::size_of_val(&TRIANGLE_VERTICES) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(
-        &triangle_vertex_buffer,
-        0,
-        bytemuck::cast_slice(&TRIANGLE_VERTICES),
-    );
-
-    let cube_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: std::mem::size_of_val(&CUBE_VERTICES) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&cube_vertex_buffer, 0, bytemuck::cast_slice(&CUBE_VERTICES));
-
-    let triangle_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 80,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let cube_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 80,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let meshes = vec![
+        mesh_gpu(&device, &queue, &TRIANGLE_VERTICES),
+        mesh_gpu(&device, &queue, &CUBE_VERTICES),
+    ];
 
     let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
@@ -2383,12 +2383,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         &mut graph,
         Box::new(GeometryPass {
             pipeline,
-            triangle_vertex_buffer,
-            triangle_instance_buffer,
-            triangle_instance_capacity: 1,
-            cube_vertex_buffer,
-            cube_instance_buffer,
-            cube_instance_capacity: 1,
+            meshes,
             camera_buffer,
             bind_group,
             tint_bind_group_layout,
