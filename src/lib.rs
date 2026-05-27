@@ -257,6 +257,34 @@ fn schedule_push(schedule: &mut Schedule, name: &'static str, system: System) {
     schedule.systems.push((name, system));
 }
 
+fn schedule_insert_before(
+    schedule: &mut Schedule,
+    target: &str,
+    name: &'static str,
+    system: System,
+) {
+    let position = schedule
+        .systems
+        .iter()
+        .position(|(existing, _)| *existing == target)
+        .unwrap_or(schedule.systems.len());
+    schedule.systems.insert(position, (name, system));
+}
+
+fn schedule_insert_after(
+    schedule: &mut Schedule,
+    target: &str,
+    name: &'static str,
+    system: System,
+) {
+    let position = schedule
+        .systems
+        .iter()
+        .position(|(existing, _)| *existing == target)
+        .map_or(schedule.systems.len(), |index| index + 1);
+    schedule.systems.insert(position, (name, system));
+}
+
 fn schedule_run(schedule: &Schedule, world: &mut World) {
     for (_, system) in &schedule.systems {
         system(world);
@@ -286,7 +314,7 @@ struct Input {
 }
 
 #[derive(Default)]
-struct World {
+pub struct World {
     tables: Vec<Table>,
     table_map: HashMap<u64, usize>,
     query_cache: HashMap<u64, Vec<usize>>,
@@ -857,58 +885,73 @@ fn run_frame_systems(world: &mut World) {
     world.schedule = schedule;
 }
 
-fn initialize_world(world: &mut World) {
-    schedule_push(&mut world.schedule, "spin", spin_system);
-    schedule_push(&mut world.schedule, "pan_orbit", pan_orbit_camera_system);
-    schedule_push(
-        &mut world.schedule,
-        "transforms",
-        update_global_transforms_system,
-    );
+pub trait State {
+    fn initialize(&mut self, world: &mut World);
+    fn run_systems(&mut self, _world: &mut World) {}
+}
 
-    let camera = spawn(
-        world,
-        LOCAL_TRANSFORM | GLOBAL_TRANSFORM | CAMERA | PAN_ORBIT_CAMERA,
-    );
-    if let Some(pan_orbit) = get_pan_orbit_camera_mut(world, camera) {
-        pan_orbit.yaw = 0.6;
-        pan_orbit.target_yaw = 0.6;
-        pan_orbit.pitch = 0.35;
-        pan_orbit.target_pitch = 0.35;
-    }
-    world.active_camera = Some(camera);
-    pan_orbit_camera_system(world);
+#[derive(Default)]
+pub struct Demo;
 
-    let count = 12;
-    for index in 0..count {
-        let angle = index as f32 / count as f32 * std::f32::consts::TAU;
-        let triangle = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | MESH);
-        if let Some(local) = get_local_transform_mut(world, triangle) {
-            local.translation = nalgebra_glm::vec3(angle.cos() * 3.0, 0.0, angle.sin() * 3.0);
-            local.scale = nalgebra_glm::vec3(0.6, 0.6, 0.6);
-            local.rotation = nalgebra_glm::quat_angle_axis(angle, &Vec3::y());
+impl State for Demo {
+    fn initialize(&mut self, world: &mut World) {
+        schedule_push(
+            &mut world.schedule,
+            "transforms",
+            update_global_transforms_system,
+        );
+        schedule_insert_before(&mut world.schedule, "transforms", "spin", spin_system);
+        schedule_insert_after(
+            &mut world.schedule,
+            "spin",
+            "pan_orbit",
+            pan_orbit_camera_system,
+        );
+
+        let camera = spawn(
+            world,
+            LOCAL_TRANSFORM | GLOBAL_TRANSFORM | CAMERA | PAN_ORBIT_CAMERA,
+        );
+        if let Some(pan_orbit) = get_pan_orbit_camera_mut(world, camera) {
+            pan_orbit.yaw = 0.6;
+            pan_orbit.target_yaw = 0.6;
+            pan_orbit.pitch = 0.35;
+            pan_orbit.target_pitch = 0.35;
         }
-        mark_local_transform_dirty(world, triangle);
-    }
+        world.active_camera = Some(camera);
+        pan_orbit_camera_system(world);
 
-    let cube = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | EMISSIVE);
-    if let Some(local) = get_local_transform_mut(world, cube) {
-        local.scale = nalgebra_glm::vec3(0.8, 0.8, 0.8);
-    }
-    if let Some(emissive) = get_emissive_mut(world, cube) {
-        emissive.0 = nalgebra_glm::vec3(4.0, 2.2, 0.8);
-    }
-    mark_local_transform_dirty(world, cube);
+        let count = 12;
+        for index in 0..count {
+            let angle = index as f32 / count as f32 * std::f32::consts::TAU;
+            let triangle = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | MESH);
+            if let Some(local) = get_local_transform_mut(world, triangle) {
+                local.translation = nalgebra_glm::vec3(angle.cos() * 3.0, 0.0, angle.sin() * 3.0);
+                local.scale = nalgebra_glm::vec3(0.6, 0.6, 0.6);
+                local.rotation = nalgebra_glm::quat_angle_axis(angle, &Vec3::y());
+            }
+            mark_local_transform_dirty(world, triangle);
+        }
 
-    let ground = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | EMISSIVE);
-    if let Some(local) = get_local_transform_mut(world, ground) {
-        local.translation = nalgebra_glm::vec3(0.0, -1.0, 0.0);
-        local.scale = nalgebra_glm::vec3(10.0, 0.1, 10.0);
+        let cube = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | EMISSIVE);
+        if let Some(local) = get_local_transform_mut(world, cube) {
+            local.scale = nalgebra_glm::vec3(0.8, 0.8, 0.8);
+        }
+        if let Some(emissive) = get_emissive_mut(world, cube) {
+            emissive.0 = nalgebra_glm::vec3(4.0, 2.2, 0.8);
+        }
+        mark_local_transform_dirty(world, cube);
+
+        let ground = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | EMISSIVE);
+        if let Some(local) = get_local_transform_mut(world, ground) {
+            local.translation = nalgebra_glm::vec3(0.0, -1.0, 0.0);
+            local.scale = nalgebra_glm::vec3(10.0, 0.1, 10.0);
+        }
+        if let Some(emissive) = get_emissive_mut(world, ground) {
+            emissive.0 = nalgebra_glm::vec3(0.12, 0.12, 0.12);
+        }
+        mark_local_transform_dirty(world, ground);
     }
-    if let Some(emissive) = get_emissive_mut(world, ground) {
-        emissive.0 = nalgebra_glm::vec3(0.12, 0.12, 0.12);
-    }
-    mark_local_transform_dirty(world, ground);
 }
 
 const TRIANGLE_VERTICES: [f32; 27] = [
@@ -1977,12 +2020,30 @@ struct Graphics {
     size: (u32, u32),
 }
 
-#[derive(Default)]
 pub struct App {
+    state: Box<dyn State>,
     world: World,
     graphics: Option<Graphics>,
     #[cfg(target_arch = "wasm32")]
     pending: Option<futures::channel::oneshot::Receiver<Graphics>>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        App::new(Box::new(Demo))
+    }
+}
+
+impl App {
+    pub fn new(state: Box<dyn State>) -> Self {
+        Self {
+            state,
+            world: World::default(),
+            graphics: None,
+            #[cfg(target_arch = "wasm32")]
+            pending: None,
+        }
+    }
 }
 
 fn fullscreen_pipeline(
@@ -2493,7 +2554,7 @@ impl ApplicationHandler for App {
                 size.height,
             )));
             self.world = new_world();
-            initialize_world(&mut self.world);
+            self.state.initialize(&mut self.world);
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -2516,7 +2577,7 @@ impl ApplicationHandler for App {
             self.graphics = Some(graphics);
             self.pending = None;
             self.world = new_world();
-            initialize_world(&mut self.world);
+            self.state.initialize(&mut self.world);
         }
 
         let Some(graphics) = self.graphics.as_mut() else {
@@ -2574,6 +2635,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 self.world.viewport = (graphics.size.0 as f32, graphics.size.1 as f32);
                 timing_system(&mut self.world);
+                self.state.run_systems(&mut self.world);
                 run_frame_systems(&mut self.world);
                 render(graphics, &self.world);
                 self.world.input.position_delta = Vec2::zeros();
