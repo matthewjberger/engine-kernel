@@ -314,14 +314,7 @@ struct Input {
 }
 
 #[derive(Default)]
-pub struct World {
-    tables: Vec<Table>,
-    table_map: HashMap<u64, usize>,
-    query_cache: HashMap<u64, Vec<usize>>,
-    locations: Vec<Option<Location>>,
-    generations: Vec<u32>,
-    free_ids: Vec<u32>,
-    current_tick: u32,
+struct Resources {
     delta_time: f32,
     viewport: (f32, f32),
     active_camera: Option<Entity>,
@@ -331,10 +324,25 @@ pub struct World {
     input: Input,
 }
 
+#[derive(Default)]
+pub struct World {
+    tables: Vec<Table>,
+    table_map: HashMap<u64, usize>,
+    query_cache: HashMap<u64, Vec<usize>>,
+    locations: Vec<Option<Location>>,
+    generations: Vec<u32>,
+    free_ids: Vec<u32>,
+    current_tick: u32,
+    resources: Resources,
+}
+
 fn new_world() -> World {
     World {
         current_tick: 1,
-        viewport: (1.0, 1.0),
+        resources: Resources {
+            viewport: (1.0, 1.0),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -599,11 +607,15 @@ fn collect_entities(world: &mut World, mask: u64) -> Vec<Entity> {
 }
 
 fn mark_local_transform_dirty(world: &mut World, entity: Entity) {
-    if !world.transform_state.children_cache_valid {
+    if !world.resources.transform_state.children_cache_valid {
         rebuild_children_cache(world);
     }
 
-    let is_parent = world.transform_state.children_cache.contains_key(&entity);
+    let is_parent = world
+        .resources
+        .transform_state
+        .children_cache
+        .contains_key(&entity);
     if !entity_has(world, entity, PARENT) && !is_parent {
         let global = match get_local_transform(world, entity) {
             Some(local) => local_transform_matrix(&local),
@@ -615,15 +627,15 @@ fn mark_local_transform_dirty(world: &mut World, entity: Entity) {
 
     let mut stack = vec![entity];
     while let Some(current) = stack.pop() {
-        world.transform_state.dirty_entities.push(current);
-        if let Some(children) = world.transform_state.children_cache.get(&current) {
+        world.resources.transform_state.dirty_entities.push(current);
+        if let Some(children) = world.resources.transform_state.children_cache.get(&current) {
             stack.extend(children.iter().copied());
         }
     }
 }
 
 fn rebuild_children_cache(world: &mut World) {
-    world.transform_state.children_cache.clear();
+    world.resources.transform_state.children_cache.clear();
 
     let mut relationships = Vec::new();
     for table in query_tables(world, PARENT).to_vec() {
@@ -637,16 +649,17 @@ fn rebuild_children_cache(world: &mut World) {
 
     for (parent, child) in relationships {
         world
+            .resources
             .transform_state
             .children_cache
             .entry(parent)
             .or_default()
             .push(child);
     }
-    for children in world.transform_state.children_cache.values_mut() {
+    for children in world.resources.transform_state.children_cache.values_mut() {
         children.sort_unstable_by_key(|entity| (entity.index, entity.generation));
     }
-    world.transform_state.children_cache_valid = true;
+    world.resources.transform_state.children_cache_valid = true;
 }
 
 fn global_transform_with_cycle_detection(
@@ -670,7 +683,7 @@ fn global_transform_with_cycle_detection(
 }
 
 fn update_global_transforms_system(world: &mut World) {
-    let mut dirty = std::mem::take(&mut world.transform_state.dirty_entities);
+    let mut dirty = std::mem::take(&mut world.resources.transform_state.dirty_entities);
     dirty.extend(collect_entities(
         world,
         LOCAL_TRANSFORM_DIRTY | LOCAL_TRANSFORM | GLOBAL_TRANSFORM,
@@ -701,7 +714,7 @@ fn update_global_transforms_system(world: &mut World) {
 const SPIN_SPEED: f32 = 0.8;
 
 fn spin_system(world: &mut World) {
-    let delta_time = world.delta_time;
+    let delta_time = world.resources.delta_time;
     for entity in collect_entities(world, RENDER_MESH) {
         if entity_has(world, entity, EMISSIVE) {
             continue;
@@ -741,19 +754,22 @@ fn lerp_and_snap_vec3(from: Vec3, to: Vec3, smoothness: f32, delta_time: f32) ->
 }
 
 fn pan_orbit_camera_system(world: &mut World) {
-    let Some(camera) = world.active_camera else {
+    let Some(camera) = world.resources.active_camera else {
         return;
     };
     if !entity_has(world, camera, PAN_ORBIT_CAMERA) {
         return;
     }
 
-    let viewport = Vec2::new(world.viewport.0.max(1.0), world.viewport.1.max(1.0));
+    let viewport = Vec2::new(
+        world.resources.viewport.0.max(1.0),
+        world.resources.viewport.1.max(1.0),
+    );
     let y_fov = camera_y_fov(world, camera);
-    let orbit = world.input.left_pressed;
-    let pan = world.input.right_pressed;
-    let position_delta = world.input.position_delta;
-    let wheel_delta = world.input.wheel_delta;
+    let orbit = world.resources.input.left_pressed;
+    let pan = world.resources.input.right_pressed;
+    let position_delta = world.resources.input.position_delta;
+    let wheel_delta = world.resources.input.wheel_delta;
 
     let Some(pan_orbit) = get_pan_orbit_camera_mut(world, camera) else {
         return;
@@ -791,7 +807,7 @@ fn pan_orbit_camera_system(world: &mut World) {
         pan_orbit.target_radius = (pan_orbit.target_radius + zoom).max(pan_orbit.zoom_lower);
     }
 
-    let delta_time = world.delta_time;
+    let delta_time = world.resources.delta_time;
     let Some(pan_orbit) = get_pan_orbit_camera_mut(world, camera) else {
         return;
     };
@@ -835,7 +851,7 @@ fn pan_orbit_camera_system(world: &mut World) {
 }
 
 fn camera_view(world: &World) -> Option<Mat4> {
-    let camera_entity = world.active_camera?;
+    let camera_entity = world.resources.active_camera?;
     let global = get_global_transform(world, camera_entity)?.0;
     let position = transform_translation(&global);
     let target = position + transform_forward(&global);
@@ -844,7 +860,7 @@ fn camera_view(world: &World) -> Option<Mat4> {
 }
 
 fn camera_projection(world: &World, aspect_ratio: f32) -> Option<Mat4> {
-    let camera_entity = world.active_camera?;
+    let camera_entity = world.resources.active_camera?;
     let camera = get_camera(world, camera_entity)?;
     Some(perspective_matrix(&camera.projection, aspect_ratio))
 }
@@ -878,18 +894,19 @@ fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3)> {
 
 fn timing_system(world: &mut World) {
     let now = Instant::now();
-    world.delta_time = world
+    world.resources.delta_time = world
+        .resources
         .timing
         .last_frame
         .map_or(0.0, |last_frame| (now - last_frame).as_secs_f32());
-    world.timing.last_frame = Some(now);
+    world.resources.timing.last_frame = Some(now);
     world.current_tick = world.current_tick.wrapping_add(1);
 }
 
 fn run_frame_systems(world: &mut World) {
-    let schedule = std::mem::take(&mut world.schedule);
+    let schedule = std::mem::take(&mut world.resources.schedule);
     schedule_run(&schedule, world);
-    world.schedule = schedule;
+    world.resources.schedule = schedule;
 }
 
 pub trait State {
@@ -903,13 +920,18 @@ pub struct Demo;
 impl State for Demo {
     fn initialize(&mut self, world: &mut World) {
         schedule_push(
-            &mut world.schedule,
+            &mut world.resources.schedule,
             "transforms",
             update_global_transforms_system,
         );
-        schedule_insert_before(&mut world.schedule, "transforms", "spin", spin_system);
+        schedule_insert_before(
+            &mut world.resources.schedule,
+            "transforms",
+            "spin",
+            spin_system,
+        );
         schedule_insert_after(
-            &mut world.schedule,
+            &mut world.resources.schedule,
             "spin",
             "pan_orbit",
             pan_orbit_camera_system,
@@ -925,7 +947,7 @@ impl State for Demo {
             pan_orbit.pitch = 0.35;
             pan_orbit.target_pitch = 0.35;
         }
-        world.active_camera = Some(camera);
+        world.resources.active_camera = Some(camera);
         pan_orbit_camera_system(world);
 
         let count = 12;
@@ -2068,7 +2090,7 @@ impl PassNode for ComputeTintPass {
     }
 
     fn execute(&mut self, context: &mut PassContext) {
-        self.time += context.world.delta_time;
+        self.time += context.world.resources.delta_time;
         let params = [self.time, 0.0, 0.0, 0.0];
         context
             .queue
@@ -2485,7 +2507,7 @@ fn resize(graphics: &mut Graphics, width: u32, height: u32) {
 }
 
 fn render(graphics: &mut Graphics, world: &World) {
-    let delta_time = world.delta_time;
+    let delta_time = world.resources.delta_time;
 
     #[cfg(target_arch = "wasm32")]
     {
@@ -2698,37 +2720,38 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left => self.world.input.left_pressed = pressed,
-                    MouseButton::Right => self.world.input.right_pressed = pressed,
+                    MouseButton::Left => self.world.resources.input.left_pressed = pressed,
+                    MouseButton::Right => self.world.resources.input.right_pressed = pressed,
                     _ => {}
                 }
                 graphics.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = Vec2::new(position.x as f32, position.y as f32);
-                if self.world.input.cursor_initialized {
-                    self.world.input.position_delta += cursor - self.world.input.cursor;
+                if self.world.resources.input.cursor_initialized {
+                    self.world.resources.input.position_delta +=
+                        cursor - self.world.resources.input.cursor;
                 } else {
-                    self.world.input.cursor_initialized = true;
+                    self.world.resources.input.cursor_initialized = true;
                 }
-                self.world.input.cursor = cursor;
+                self.world.resources.input.cursor = cursor;
                 graphics.window.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.world.input.wheel_delta += match delta {
+                self.world.resources.input.wheel_delta += match delta {
                     MouseScrollDelta::LineDelta(_, vertical) => vertical,
                     MouseScrollDelta::PixelDelta(position) => position.y as f32 / 120.0,
                 };
                 graphics.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                self.world.viewport = (graphics.size.0 as f32, graphics.size.1 as f32);
+                self.world.resources.viewport = (graphics.size.0 as f32, graphics.size.1 as f32);
                 timing_system(&mut self.world);
                 self.state.run_systems(&mut self.world);
                 run_frame_systems(&mut self.world);
                 render(graphics, &self.world);
-                self.world.input.position_delta = Vec2::zeros();
-                self.world.input.wheel_delta = 0.0;
+                self.world.resources.input.position_delta = Vec2::zeros();
+                self.world.resources.input.wheel_delta = 0.0;
                 graphics.window.request_redraw();
             }
             _ => {}
