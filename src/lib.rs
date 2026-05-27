@@ -77,6 +77,9 @@ struct LocalTransformDirty;
 #[derive(Clone, Copy, Default)]
 struct Mesh;
 
+#[derive(Clone, Copy, Default)]
+struct Emissive(Vec3);
+
 #[derive(Clone, Copy)]
 struct PerspectiveCamera {
     y_fov_radians: f32,
@@ -188,6 +191,7 @@ const LOCAL_TRANSFORM_DIRTY: u64 = 8;
 const CAMERA: u64 = 16;
 const PAN_ORBIT_CAMERA: u64 = 32;
 const MESH: u64 = 64;
+const EMISSIVE: u64 = 128;
 
 macro_rules! components {
     ($($name:ty, $field:ident, $bit:expr);* $(;)?) => {
@@ -241,6 +245,7 @@ components!(
     Camera,              cameras,               CAMERA;
     PanOrbitCamera,      pan_orbit_cameras,     PAN_ORBIT_CAMERA;
     Mesh,                meshes,                MESH;
+    Emissive,            emissives,             EMISSIVE;
 );
 
 type System = fn(&mut World);
@@ -528,6 +533,16 @@ fn get_pan_orbit_camera_mut(world: &mut World, entity: Entity) -> Option<&mut Pa
     })
 }
 
+fn get_emissive_mut(world: &mut World, entity: Entity) -> Option<&mut Emissive> {
+    let location = get_location(world, entity)?;
+    let tick = world.current_tick;
+    let table = &mut world.tables[location.table];
+    (table.mask & EMISSIVE != 0).then(|| {
+        table.emissives[location.row].1 = tick;
+        &mut table.emissives[location.row].0
+    })
+}
+
 fn collect_entities(world: &mut World, mask: u64) -> Vec<Entity> {
     let mut entities = Vec::new();
     for table in query_tables(world, mask).to_vec() {
@@ -793,6 +808,19 @@ fn renderable_models(world: &World) -> Vec<Mat4> {
     models
 }
 
+fn emissive_cubes(world: &World) -> Vec<(Mat4, Vec3)> {
+    let mut cubes = Vec::new();
+    for table in &world.tables {
+        if table.mask & (EMISSIVE | GLOBAL_TRANSFORM) != (EMISSIVE | GLOBAL_TRANSFORM) {
+            continue;
+        }
+        for (transform, emissive) in table.global_transforms.iter().zip(table.emissives.iter()) {
+            cubes.push((transform.0.0, emissive.0.0));
+        }
+    }
+    cubes
+}
+
 fn timing_system(world: &mut World) {
     let now = Instant::now();
     world.delta_time = world
@@ -842,10 +870,34 @@ fn initialize_world(world: &mut World) {
         }
         mark_local_transform_dirty(world, triangle);
     }
+
+    let cube = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | EMISSIVE);
+    if let Some(local) = get_local_transform_mut(world, cube) {
+        local.scale = nalgebra_glm::vec3(0.8, 0.8, 0.8);
+    }
+    if let Some(emissive) = get_emissive_mut(world, cube) {
+        emissive.0 = nalgebra_glm::vec3(4.0, 2.2, 0.8);
+    }
+    mark_local_transform_dirty(world, cube);
 }
 
 const TRIANGLE_VERTICES: [f32; 18] = [
     1., -1., 0., 1., 0., 0., -1., -1., 0., 0., 1., 0., 0., 1., 0., 0., 0., 1.,
+];
+
+const CUBE_VERTICES: [f32; 216] = [
+    1., -1., -1., 1., 1., 1., 1., 1., -1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., -1., -1., 1.,
+    1., 1., 1., 1., 1., 1., 1., 1., 1., -1., 1., 1., 1., 1., -1., -1., -1., 0.55, 0.55, 0.55, -1.,
+    1., 1., 0.55, 0.55, 0.55, -1., 1., -1., 0.55, 0.55, 0.55, -1., -1., -1., 0.55, 0.55, 0.55, -1.,
+    -1., 1., 0.55, 0.55, 0.55, -1., 1., 1., 0.55, 0.55, 0.55, -1., 1., -1., 0.9, 0.9, 0.9, -1., 1.,
+    1., 0.9, 0.9, 0.9, 1., 1., 1., 0.9, 0.9, 0.9, -1., 1., -1., 0.9, 0.9, 0.9, 1., 1., 1., 0.9,
+    0.9, 0.9, 1., 1., -1., 0.9, 0.9, 0.9, -1., -1., -1., 0.45, 0.45, 0.45, 1., -1., 1., 0.45, 0.45,
+    0.45, -1., -1., 1., 0.45, 0.45, 0.45, -1., -1., -1., 0.45, 0.45, 0.45, 1., -1., -1., 0.45,
+    0.45, 0.45, 1., -1., 1., 0.45, 0.45, 0.45, -1., -1., 1., 0.8, 0.8, 0.8, 1., -1., 1., 0.8, 0.8,
+    0.8, 1., 1., 1., 0.8, 0.8, 0.8, -1., -1., 1., 0.8, 0.8, 0.8, 1., 1., 1., 0.8, 0.8, 0.8, -1.,
+    1., 1., 0.8, 0.8, 0.8, -1., -1., -1., 0.65, 0.65, 0.65, 1., 1., -1., 0.65, 0.65, 0.65, 1., -1.,
+    -1., 0.65, 0.65, 0.65, -1., -1., -1., 0.65, 0.65, 0.65, -1., 1., -1., 0.65, 0.65, 0.65, 1., 1.,
+    -1., 0.65, 0.65, 0.65,
 ];
 
 const TINT_COUNT: u64 = 64;
@@ -861,20 +913,22 @@ struct VertexInput {
     @location(3) model_1: vec4<f32>,
     @location(4) model_2: vec4<f32>,
     @location(5) model_3: vec4<f32>,
+    @location(6) emissive: vec4<f32>,
 }
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) @interpolate(flat) instance: u32,
+    @location(2) @interpolate(flat) emissive: vec3<f32>,
 }
 @vertex fn vs(in: VertexInput, @builtin(instance_index) instance_index: u32) -> VertexOutput {
     let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
     let clip = view_projection * model * vec4<f32>(in.position, 1.0);
-    return VertexOutput(clip, vec4<f32>(in.color, 1.0), instance_index);
+    return VertexOutput(clip, vec4<f32>(in.color, 1.0), instance_index, in.emissive.rgb);
 }
 @fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
     let tint = tints[in.instance % 64u].rgb;
-    return vec4<f32>(in.color.rgb * tint, 1.0);
+    return vec4<f32>(in.color.rgb * (tint + in.emissive), 1.0);
 }
 ";
 
@@ -897,7 +951,7 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 ";
 
-const TONEMAP_SHADER: &str = "
+const FULLSCREEN_VERTEX: &str = "
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -910,8 +964,40 @@ struct VertexOutput {
     out.uv = vec2<f32>(x, y);
     return out;
 }
+";
+
+const BRIGHT_SHADER: &str = "
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
 @group(0) @binding(1) var scene_sampler: sampler;
+@fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(scene_texture, scene_sampler, in.uv).rgb;
+    return vec4<f32>(max(color - vec3<f32>(1.0), vec3<f32>(0.0)), 1.0);
+}
+";
+
+const BLUR_SHADER: &str = "
+@group(0) @binding(0) var input_texture: texture_2d<f32>;
+@group(0) @binding(1) var input_sampler: sampler;
+@group(0) @binding(2) var<uniform> axis: vec4<f32>;
+@fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
+    let step = axis.xy / vec2<f32>(textureDimensions(input_texture));
+    var sum = textureSample(input_texture, input_sampler, in.uv).rgb * 0.227027;
+    sum += textureSample(input_texture, input_sampler, in.uv + step * 1.0).rgb * 0.194594;
+    sum += textureSample(input_texture, input_sampler, in.uv - step * 1.0).rgb * 0.194594;
+    sum += textureSample(input_texture, input_sampler, in.uv + step * 2.0).rgb * 0.121622;
+    sum += textureSample(input_texture, input_sampler, in.uv - step * 2.0).rgb * 0.121622;
+    sum += textureSample(input_texture, input_sampler, in.uv + step * 3.0).rgb * 0.054054;
+    sum += textureSample(input_texture, input_sampler, in.uv - step * 3.0).rgb * 0.054054;
+    sum += textureSample(input_texture, input_sampler, in.uv + step * 4.0).rgb * 0.016216;
+    sum += textureSample(input_texture, input_sampler, in.uv - step * 4.0).rgb * 0.016216;
+    return vec4<f32>(sum, 1.0);
+}
+";
+
+const COMPOSITE_SHADER: &str = "
+@group(0) @binding(0) var scene_texture: texture_2d<f32>;
+@group(0) @binding(1) var scene_sampler: sampler;
+@group(0) @binding(2) var bloom_texture: texture_2d<f32>;
 fn aces(color: vec3<f32>) -> vec3<f32> {
     let a = 2.51;
     let b = 0.03;
@@ -921,8 +1007,9 @@ fn aces(color: vec3<f32>) -> vec3<f32> {
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 @fragment fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
-    let color = textureSample(scene_texture, scene_sampler, in.uv).rgb;
-    return vec4<f32>(aces(color), 1.0);
+    let scene = textureSample(scene_texture, scene_sampler, in.uv).rgb;
+    let bloom = textureSample(bloom_texture, scene_sampler, in.uv).rgb;
+    return vec4<f32>(aces(scene + bloom * 0.8), 1.0);
 }
 ";
 
@@ -1364,17 +1451,42 @@ fn render_graph_execute(
     encoder.finish()
 }
 
-struct TrianglePass {
+struct GeometryPass {
     pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    instance_buffer: wgpu::Buffer,
-    instance_capacity: u32,
+    triangle_vertex_buffer: wgpu::Buffer,
+    triangle_instance_buffer: wgpu::Buffer,
+    triangle_instance_capacity: u32,
+    cube_vertex_buffer: wgpu::Buffer,
+    cube_instance_buffer: wgpu::Buffer,
+    cube_instance_capacity: u32,
     view_projection_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     tint_bind_group_layout: wgpu::BindGroupLayout,
 }
 
-impl PassNode for TrianglePass {
+fn upload_instances(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &mut wgpu::Buffer,
+    capacity: &mut u32,
+    data: &[f32],
+    count: u32,
+) {
+    if count > *capacity {
+        *capacity = count.next_power_of_two();
+        *buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: *capacity as u64 * 80,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+    if count > 0 {
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+    }
+}
+
+impl PassNode for GeometryPass {
     fn reads(&self) -> Vec<&'static str> {
         vec!["tints"]
     }
@@ -1397,27 +1509,36 @@ impl PassNode for TrianglePass {
         );
 
         let models = renderable_models(context.world);
-        let instance_count = models.len() as u32;
-        if instance_count > self.instance_capacity {
-            self.instance_capacity = instance_count.next_power_of_two();
-            self.instance_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: self.instance_capacity as u64 * 64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+        let triangle_count = models.len() as u32;
+        let mut triangle_data: Vec<f32> = Vec::with_capacity(models.len() * 20);
+        for model in &models {
+            triangle_data.extend_from_slice(model.as_slice());
+            triangle_data.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
         }
-        if instance_count > 0 {
-            let mut instance_data: Vec<f32> = Vec::with_capacity(models.len() * 16);
-            for model in &models {
-                instance_data.extend_from_slice(model.as_slice());
-            }
-            context.queue.write_buffer(
-                &self.instance_buffer,
-                0,
-                bytemuck::cast_slice(&instance_data),
-            );
+        upload_instances(
+            context.device,
+            context.queue,
+            &mut self.triangle_instance_buffer,
+            &mut self.triangle_instance_capacity,
+            &triangle_data,
+            triangle_count,
+        );
+
+        let cubes = emissive_cubes(context.world);
+        let cube_count = cubes.len() as u32;
+        let mut cube_data: Vec<f32> = Vec::with_capacity(cubes.len() * 20);
+        for (model, emissive) in &cubes {
+            cube_data.extend_from_slice(model.as_slice());
+            cube_data.extend_from_slice(&[emissive.x, emissive.y, emissive.z, 0.0]);
         }
+        upload_instances(
+            context.device,
+            context.queue,
+            &mut self.cube_instance_buffer,
+            &mut self.cube_instance_capacity,
+            &cube_data,
+            cube_count,
+        );
 
         let tints = graph_buffer(context, "tints");
         let tint_bind_group = context
@@ -1455,30 +1576,35 @@ impl PassNode for TrianglePass {
                 }),
                 ..Default::default()
             });
-        if instance_count > 0 {
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_bind_group(1, &tint_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            pass.draw(0..3, 0..instance_count);
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_bind_group(1, &tint_bind_group, &[]);
+        if triangle_count > 0 {
+            pass.set_vertex_buffer(0, self.triangle_vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.triangle_instance_buffer.slice(..));
+            pass.draw(0..3, 0..triangle_count);
+        }
+        if cube_count > 0 {
+            pass.set_vertex_buffer(0, self.cube_vertex_buffer.slice(..));
+            pass.set_vertex_buffer(1, self.cube_instance_buffer.slice(..));
+            pass.draw(0..36, 0..cube_count);
         }
     }
 }
 
-struct TonemapPass {
+struct BrightPass {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
 
-impl PassNode for TonemapPass {
+impl PassNode for BrightPass {
     fn reads(&self) -> Vec<&'static str> {
         vec!["scene"]
     }
 
     fn color_writes(&self) -> Vec<&'static str> {
-        vec!["color"]
+        vec!["bright"]
     }
 
     fn execute(&mut self, context: &mut PassContext) {
@@ -1496,6 +1622,128 @@ impl PassNode for TonemapPass {
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+
+        let (color_view, color_load, color_store) = color_attachment(context, "bright");
+        let mut pass = context
+            .encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: color_load,
+                        store: color_store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+struct BlurPass {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    axis_buffer: wgpu::Buffer,
+}
+
+impl PassNode for BlurPass {
+    fn reads(&self) -> Vec<&'static str> {
+        vec!["input"]
+    }
+
+    fn color_writes(&self) -> Vec<&'static str> {
+        vec!["output"]
+    }
+
+    fn execute(&mut self, context: &mut PassContext) {
+        let input_view = read_view(context, "input");
+        let bind_group = context
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(input_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.axis_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let (color_view, color_load, color_store) = color_attachment(context, "output");
+        let mut pass = context
+            .encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: color_load,
+                        store: color_store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+struct CompositePass {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+impl PassNode for CompositePass {
+    fn reads(&self) -> Vec<&'static str> {
+        vec!["scene", "bloom"]
+    }
+
+    fn color_writes(&self) -> Vec<&'static str> {
+        vec!["color"]
+    }
+
+    fn execute(&mut self, context: &mut PassContext) {
+        let scene_view = read_view(context, "scene");
+        let bloom_view = read_view(context, "bloom");
+        let bind_group = context
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(scene_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(bloom_view),
                     },
                 ],
             });
@@ -1600,6 +1848,57 @@ pub struct App {
     pending: Option<futures::channel::oneshot::Receiver<Graphics>>,
 }
 
+fn fullscreen_pipeline(
+    device: &wgpu::Device,
+    fragment: &str,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(format!("{FULLSCREEN_VERTEX}{fragment}").into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(format.into())],
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn linear_sampler(device: &wgpu::Device) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    })
+}
+
+fn axis_buffer(device: &wgpu::Device, queue: &wgpu::Queue, axis: [f32; 4]) -> wgpu::Buffer {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&axis));
+    buffer
+}
+
 async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -1626,8 +1925,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
     });
     let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-    let instance_attrs =
-        wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4];
+    let instance_attrs = wgpu::vertex_attr_array![
+        2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4
+    ];
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
         layout: None,
@@ -1642,7 +1942,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
                     attributes: &vertex_attrs,
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: 64,
+                    array_stride: 80,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &instance_attrs,
                 },
@@ -1667,49 +1967,46 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         cache: None,
     });
 
-    let tonemap_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: None,
-        source: wgpu::ShaderSource::Wgsl(TONEMAP_SHADER.into()),
-    });
-    let tonemap_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None,
-        layout: None,
-        vertex: wgpu::VertexState {
-            module: &tonemap_shader,
-            entry_point: Some("vs"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &tonemap_shader,
-            entry_point: Some("fs"),
-            compilation_options: Default::default(),
-            targets: &[Some(surface_config.format.into())],
-        }),
-        primitive: Default::default(),
-        depth_stencil: None,
-        multisample: Default::default(),
-        multiview_mask: None,
-        cache: None,
-    });
-    let tonemap_bind_group_layout = tonemap_pipeline.get_bind_group_layout(0);
-    let tonemap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        ..Default::default()
-    });
+    let bright_pipeline = fullscreen_pipeline(&device, BRIGHT_SHADER, SCENE_FORMAT);
+    let bright_bind_group_layout = bright_pipeline.get_bind_group_layout(0);
 
-    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    let blur_horizontal_pipeline = fullscreen_pipeline(&device, BLUR_SHADER, SCENE_FORMAT);
+    let blur_horizontal_bind_group_layout = blur_horizontal_pipeline.get_bind_group_layout(0);
+    let blur_vertical_pipeline = fullscreen_pipeline(&device, BLUR_SHADER, SCENE_FORMAT);
+    let blur_vertical_bind_group_layout = blur_vertical_pipeline.get_bind_group_layout(0);
+
+    let composite_pipeline = fullscreen_pipeline(&device, COMPOSITE_SHADER, surface_config.format);
+    let composite_bind_group_layout = composite_pipeline.get_bind_group_layout(0);
+
+    let triangle_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: std::mem::size_of_val(&TRIANGLE_VERTICES) as u64,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&TRIANGLE_VERTICES));
+    queue.write_buffer(
+        &triangle_vertex_buffer,
+        0,
+        bytemuck::cast_slice(&TRIANGLE_VERTICES),
+    );
 
-    let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    let cube_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 64,
+        size: std::mem::size_of_val(&CUBE_VERTICES) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&cube_vertex_buffer, 0, bytemuck::cast_slice(&CUBE_VERTICES));
+
+    let triangle_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 80,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let cube_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 80,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -1779,6 +2076,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let scene = add_color_resource(&mut graph, false, SCENE_FORMAT, background);
     let depth = add_depth_resource(&mut graph, DEPTH_FORMAT, 0.0);
     let tints = add_buffer_resource(&mut graph, TINT_COUNT * 16);
+    let bright = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
+    let blur_temp = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
+    let bloom = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     add_pass(
         &mut graph,
         Box::new(ComputeTintPass {
@@ -1791,11 +2091,14 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     );
     add_pass(
         &mut graph,
-        Box::new(TrianglePass {
+        Box::new(GeometryPass {
             pipeline,
-            vertex_buffer,
-            instance_buffer,
-            instance_capacity: 1,
+            triangle_vertex_buffer,
+            triangle_instance_buffer,
+            triangle_instance_capacity: 1,
+            cube_vertex_buffer,
+            cube_instance_buffer,
+            cube_instance_capacity: 1,
             view_projection_buffer,
             bind_group,
             tint_bind_group_layout,
@@ -1804,12 +2107,41 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     );
     add_pass(
         &mut graph,
-        Box::new(TonemapPass {
-            pipeline: tonemap_pipeline,
-            bind_group_layout: tonemap_bind_group_layout,
-            sampler: tonemap_sampler,
+        Box::new(BrightPass {
+            pipeline: bright_pipeline,
+            bind_group_layout: bright_bind_group_layout,
+            sampler: linear_sampler(&device),
         }),
-        &[("scene", scene), ("color", swapchain)],
+        &[("scene", scene), ("bright", bright)],
+    );
+    add_pass(
+        &mut graph,
+        Box::new(BlurPass {
+            pipeline: blur_horizontal_pipeline,
+            bind_group_layout: blur_horizontal_bind_group_layout,
+            sampler: linear_sampler(&device),
+            axis_buffer: axis_buffer(&device, &queue, [1.0, 0.0, 0.0, 0.0]),
+        }),
+        &[("input", bright), ("output", blur_temp)],
+    );
+    add_pass(
+        &mut graph,
+        Box::new(BlurPass {
+            pipeline: blur_vertical_pipeline,
+            bind_group_layout: blur_vertical_bind_group_layout,
+            sampler: linear_sampler(&device),
+            axis_buffer: axis_buffer(&device, &queue, [0.0, 1.0, 0.0, 0.0]),
+        }),
+        &[("input", blur_temp), ("output", bloom)],
+    );
+    add_pass(
+        &mut graph,
+        Box::new(CompositePass {
+            pipeline: composite_pipeline,
+            bind_group_layout: composite_bind_group_layout,
+            sampler: linear_sampler(&device),
+        }),
+        &[("scene", scene), ("bloom", bloom), ("color", swapchain)],
     );
     render_graph_compile(&mut graph);
 
@@ -1868,10 +2200,21 @@ fn render(graphics: &mut Graphics, world: &World) {
         ));
     }
 
+    let logical_targets = graphics
+        .graph
+        .resource_physical
+        .iter()
+        .filter(|physical| physical.is_some())
+        .count();
+    let physical_targets = graphics.graph.physical_formats.len();
+
     let egui_output = graphics.egui_state.egui_ctx().run_ui(egui_input, |ui| {
         egui::Window::new("engine").show(ui.ctx(), |ui| {
-            ui.label("Spinning triangles");
+            ui.label("Spinning triangles + emissive cube");
             ui.label(format!("{:.0} fps", 1. / delta_time.max(1e-6)));
+            ui.label(format!(
+                "render targets: {logical_targets} logical / {physical_targets} physical"
+            ));
             ui.label("drag-left orbit, drag-right pan, scroll zoom");
         });
     });
