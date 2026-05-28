@@ -1723,6 +1723,7 @@ struct Camera {
     view_projection: mat4x4<f32>,
     view: mat4x4<f32>,
     camera_position: vec4<f32>,
+    inverse_projection: mat4x4<f32>,
 }
 struct Lights {
     ambient: vec4<f32>,
@@ -2093,6 +2094,42 @@ fn planar_uv(local_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
     var out: GeometryOutput;
     out.color = vec4<f32>(shaded, 1.0);
     out.normal = vec4<f32>(normalize(in.view_normal), 1.0);
+    return out;
+}
+";
+
+const SKY_SHADER: &str = "
+struct Camera {
+    view_projection: mat4x4<f32>,
+    view: mat4x4<f32>,
+    camera_position: vec4<f32>,
+    inverse_projection: mat4x4<f32>,
+}
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var environment: texture_cube<f32>;
+@group(0) @binding(2) var environment_sampler: sampler;
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) world_direction: vec3<f32>,
+}
+@vertex fn vs(@builtin(vertex_index) index: u32) -> VertexOutput {
+    let position = vec4<f32>(f32(i32(index) / 2) * 4.0 - 1.0, f32(i32(index) & 1) * 4.0 - 1.0, 0.0, 1.0);
+    let inverse_view_rotation = transpose(mat3x3<f32>(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz));
+    let unprojected = camera.inverse_projection * position;
+    var out: VertexOutput;
+    out.position = position;
+    out.world_direction = inverse_view_rotation * unprojected.xyz;
+    return out;
+}
+struct SkyOutput {
+    @location(0) color: vec4<f32>,
+    @location(1) normal: vec4<f32>,
+}
+@fragment fn fs(in: VertexOutput) -> SkyOutput {
+    let color = textureSampleLevel(environment, environment_sampler, normalize(in.world_direction), 0.0).rgb;
+    var out: SkyOutput;
+    out.color = vec4<f32>(color, 1.0);
+    out.normal = vec4<f32>(0.0, 0.0, 1.0, 1.0);
     return out;
 }
 ";
@@ -2685,6 +2722,8 @@ struct GeometryPass {
     cluster_bounds_bind_group: wgpu::BindGroup,
     cluster_assign_pipeline: wgpu::ComputePipeline,
     cluster_assign_bind_group: wgpu::BindGroup,
+    sky_pipeline: wgpu::RenderPipeline,
+    sky_bind_group: wgpu::BindGroup,
     meshes: Vec<MeshGpu>,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
@@ -2749,15 +2788,19 @@ impl PassNode for GeometryPass {
             .unwrap_or_else(Mat4::identity);
         let view = camera_view(context.world).unwrap_or_else(Mat4::identity);
 
+        let projection =
+            camera_projection(context.world, context.aspect_ratio).unwrap_or_else(Mat4::identity);
+        let inverse_projection = nalgebra_glm::inverse(&projection);
         let (lights, spot_shadows) = gather_lights(context.world);
         let sun = nalgebra_glm::vec3(lights[4], lights[5], lights[6]);
         let camera_position = view
             .try_inverse()
             .map_or(Vec3::zeros(), |inverse| transform_translation(&inverse));
-        let mut camera_data = [0.0f32; 36];
+        let mut camera_data = [0.0f32; 52];
         camera_data[..16].copy_from_slice(view_projection.as_slice());
         camera_data[16..32].copy_from_slice(view.as_slice());
         camera_data[32..35].copy_from_slice(camera_position.as_slice());
+        camera_data[36..52].copy_from_slice(inverse_projection.as_slice());
         context
             .queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&camera_data));
@@ -2822,9 +2865,6 @@ impl PassNode for GeometryPass {
             bytemuck::cast_slice(&spot_shadow_data),
         );
 
-        let projection =
-            camera_projection(context.world, context.aspect_ratio).unwrap_or_else(Mat4::identity);
-        let inverse_projection = nalgebra_glm::inverse(&projection);
         let screen_width = context.size.0.max(1) as f32;
         let screen_height = context.size.1.max(1) as f32;
         let point_count = lights[12] as u32;
@@ -3019,6 +3059,9 @@ impl PassNode for GeometryPass {
                 }),
                 ..Default::default()
             });
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.set_bind_group(0, &self.sky_bind_group, &[]);
+        pass.draw(0..3, 0..1);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         for (handle, mesh) in self.meshes.iter().enumerate() {
@@ -3728,7 +3771,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         mesh_gpu(&device, &queue, &CUBE_VERTICES),
     ];
 
-    let camera_buffer = uniform_buffer(&device, 144);
+    let camera_buffer = uniform_buffer(&device, 208);
     let lights_buffer = uniform_buffer(&device, 576);
     let shadow_buffer = uniform_buffer(&device, 368);
     let spot_shadow_buffer = uniform_buffer(&device, 320);
@@ -3762,6 +3805,46 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             (13, wgpu::BindingResource::TextureView(&prefiltered_view)),
             (14, wgpu::BindingResource::TextureView(&brdf_view)),
             (15, wgpu::BindingResource::Sampler(&ibl_sampler)),
+        ],
+    );
+    let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(SKY_SHADER.into()),
+    });
+    let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &sky_shader,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &sky_shader,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(SCENE_FORMAT.into()), Some(SCENE_FORMAT.into())],
+        }),
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let sky_bind_group = bind_group(
+        &device,
+        &sky_pipeline.get_bind_group_layout(0),
+        vec![
+            (0, camera_buffer.as_entire_binding()),
+            (1, wgpu::BindingResource::TextureView(&prefiltered_view)),
+            (2, wgpu::BindingResource::Sampler(&ibl_sampler)),
         ],
     );
     let cluster_bounds_pipeline = compute_pipeline(&device, CLUSTER_BOUNDS_SHADER);
@@ -3862,6 +3945,8 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             cluster_bounds_bind_group,
             cluster_assign_pipeline,
             cluster_assign_bind_group,
+            sky_pipeline,
+            sky_bind_group,
             meshes,
             camera_buffer,
             lights_buffer,
