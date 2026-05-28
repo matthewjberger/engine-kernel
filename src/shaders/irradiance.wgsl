@@ -9,7 +9,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let normal = cube_direction(id.z, uv);
     let basis = tangent_basis(normal);
     var color = vec3<f32>(0.0);
-    let samples = 256u;
+    let samples = 1024u;
     for (var index = 0u; index < samples; index = index + 1u) {
         let xi = hammersley(index, samples);
         let phi = 2.0 * PI * xi.x;

@@ -3050,8 +3050,8 @@ fn generate_ibl(
     wgpu::TextureView,
     wgpu::Sampler,
 ) {
-    let irradiance = ibl_storage_texture(device, 32, 6, 1);
-    let prefiltered = ibl_storage_texture(device, 128, 6, 5);
+    let irradiance = ibl_storage_texture(device, 64, 6, 1);
+    let prefiltered = ibl_storage_texture(device, 512, 6, 5);
     let brdf = ibl_storage_texture(device, 256, 1, 1);
 
     let irradiance_pipeline = compute_pipeline(device, &format!("{IBL_COMMON}{IRRADIANCE_SHADER}"));
@@ -3123,13 +3123,13 @@ fn generate_ibl(
         });
         pass.set_pipeline(&irradiance_pipeline);
         pass.set_bind_group(0, &irradiance_bind, &[]);
-        pass.dispatch_workgroups(4, 4, 6);
+        pass.dispatch_workgroups(8, 8, 6);
         pass.set_pipeline(&brdf_pipeline);
         pass.set_bind_group(0, &brdf_bind, &[]);
         pass.dispatch_workgroups(32, 32, 1);
     }
     for (mip, prefilter_bind) in prefilter_binds.iter().enumerate() {
-        let groups = (128u32 >> mip).div_ceil(8);
+        let groups = (512u32 >> mip).div_ceil(8);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: None,
             timestamp_writes: None,
@@ -3477,8 +3477,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         &sky_pipeline.get_bind_group_layout(0),
         vec![
             (0, camera_buffer.as_entire_binding()),
-            (1, wgpu::BindingResource::TextureView(&prefiltered_view)),
-            (2, wgpu::BindingResource::Sampler(&ibl_sampler)),
+            (1, wgpu::BindingResource::TextureView(&equirect_view)),
         ],
     );
     let cluster_bounds_pipeline = compute_pipeline(&device, CLUSTER_BOUNDS_SHADER);

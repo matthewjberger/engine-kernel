@@ -11,7 +11,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let roughness = prefilter_params.x;
     var color = vec3<f32>(0.0);
     var weight = 0.0;
-    let samples = 128u;
+    let samples = 512u;
     for (var index = 0u; index < samples; index = index + 1u) {
         let half_vector = importance_ggx(hammersley(index, samples), roughness, normal);
         let light = reflect(-normal, half_vector);
