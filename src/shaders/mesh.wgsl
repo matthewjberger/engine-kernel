@@ -57,6 +57,8 @@ struct LightGrid {
 @group(0) @binding(14) var brdf_lut: texture_2d<f32>;
 @group(0) @binding(15) var ibl_sampler: sampler;
 @group(0) @binding(16) var normal_textures: texture_2d_array<f32>;
+@group(0) @binding(17) var orm_textures: texture_2d_array<f32>;
+@group(0) @binding(18) var emissive_textures: texture_2d_array<f32>;
 
 fn cotangent_frame(normal: vec3<f32>, position: vec3<f32>, uv: vec2<f32>) -> mat3x3<f32> {
     let dp1 = dpdx(position);
@@ -240,7 +242,7 @@ struct VertexInput {
     @location(5) model_3: vec4<f32>,
     @location(6) emissive: vec4<f32>,
     @location(8) albedo_metallic: vec4<f32>,
-    @location(9) layers: vec2<f32>,
+    @location(9) layers: vec4<f32>,
 }
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -254,6 +256,8 @@ struct VertexOutput {
     @location(8) @interpolate(flat) base_layer: u32,
     @location(9) uv: vec2<f32>,
     @location(10) @interpolate(flat) normal_layer: u32,
+    @location(11) @interpolate(flat) orm_layer: u32,
+    @location(12) @interpolate(flat) emissive_layer: u32,
 }
 struct GeometryOutput {
     @location(0) color: vec4<f32>,
@@ -314,6 +318,7 @@ fn lighting(
     view: vec3<f32>,
     metallic: f32,
     roughness: f32,
+    occlusion: f32,
     frag_coord: vec2<f32>,
 ) -> vec3<f32> {
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
@@ -324,7 +329,7 @@ fn lighting(
     let env_brdf = textureSampleLevel(brdf_lut, ibl_sampler, vec2<f32>(n_dot_v, roughness), 0.0).rg;
     let diffuse_ibl = irradiance * albedo * (vec3<f32>(1.0) - f_roughness) * (1.0 - metallic);
     let specular_ibl = prefiltered * (f_roughness * env_brdf.x + env_brdf.y);
-    var color = diffuse_ibl + specular_ibl;
+    var color = (diffuse_ibl + specular_ibl) * occlusion;
     let sun = lights.sun_direction.xyz;
     let view_depth = -(camera.view * vec4<f32>(world_position, 1.0)).z;
     let sun_shadow = calculate_shadow(world_position, normal, view_depth);
@@ -366,6 +371,8 @@ fn lighting(
         u32(in.layers.x),
         planar_uv(in.position * model_scale, in.normal),
         u32(in.layers.y),
+        u32(in.layers.z),
+        u32(in.layers.w),
     );
 }
 fn planar_uv(local_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
@@ -379,15 +386,17 @@ fn planar_uv(local_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
     return uv * 0.5;
 }
 @fragment fn fs(in: VertexOutput) -> GeometryOutput {
-    let emissive_surface = in.emissive.r + in.emissive.g + in.emissive.b > 0.0;
     let geometric_normal = normalize(in.world_normal);
     let tangent_normal = textureSample(normal_textures, albedo_sampler, in.uv, in.normal_layer).xyz * 2.0 - 1.0;
     let normal = normalize(cotangent_frame(geometric_normal, in.world_position, in.uv) * tangent_normal);
     let view = normalize(camera.camera_position.xyz - in.world_position);
-    let texel = textureSample(albedo_textures, albedo_sampler, in.uv, in.base_layer).rgb;
-    let albedo = in.color.rgb * in.albedo * texel;
-    let lit = lighting(albedo, in.world_position, normal, view, in.material.x, max(in.material.y, 0.04), in.position.xy);
-    let shaded = select(lit, in.color.rgb * in.emissive, emissive_surface);
+    let albedo = in.color.rgb * in.albedo * textureSample(albedo_textures, albedo_sampler, in.uv, in.base_layer).rgb;
+    let orm = textureSample(orm_textures, albedo_sampler, in.uv, in.orm_layer).rgb;
+    let metallic = in.material.x * orm.b;
+    let roughness = clamp(max(in.material.y, 0.04) * orm.g, 0.04, 1.0);
+    let lit = lighting(albedo, in.world_position, normal, view, metallic, roughness, orm.r, in.position.xy);
+    let emissive_color = in.emissive * textureSample(emissive_textures, albedo_sampler, in.uv, in.emissive_layer).rgb;
+    let shaded = lit + emissive_color;
     var out: GeometryOutput;
     out.color = vec4<f32>(shaded, 1.0);
     out.normal = vec4<f32>(normalize(in.view_normal), 1.0);

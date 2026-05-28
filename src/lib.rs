@@ -105,6 +105,8 @@ struct Material {
     roughness: f32,
     base_layer: u32,
     normal_layer: u32,
+    orm_layer: u32,
+    emissive_layer: u32,
 }
 
 impl Default for Material {
@@ -115,6 +117,8 @@ impl Default for Material {
             roughness: 0.6,
             base_layer: 0,
             normal_layer: 0,
+            orm_layer: 0,
+            emissive_layer: 0,
         }
     }
 }
@@ -1362,6 +1366,8 @@ impl State for Demo {
                     roughness: 0.35,
                     base_layer: 1,
                     normal_layer: 1,
+                    orm_layer: 1,
+                    emissive_layer: 0,
                 },
             });
         }
@@ -1392,6 +1398,8 @@ impl State for Demo {
                 roughness: 0.9,
                 base_layer: 2,
                 normal_layer: 2,
+                orm_layer: 0,
+                emissive_layer: 0,
             },
         });
     }
@@ -1911,7 +1919,7 @@ fn upload_instances(
         *capacity = count.next_power_of_two();
         *buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: *capacity as u64 * 104,
+            size: *capacity as u64 * 112,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1931,7 +1939,7 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
     queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 104,
+        size: 112,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -2143,7 +2151,7 @@ impl PassNode for GeometryPass {
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
             let instances = mesh_instances(context.world, handle as u32);
             let count = instances.len() as u32;
-            let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 26);
+            let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 28);
             for (model, emissive, material) in &instances {
                 data.extend_from_slice(model.as_slice());
                 data.extend_from_slice(&[emissive.x, emissive.y, emissive.z, material.roughness]);
@@ -2155,6 +2163,8 @@ impl PassNode for GeometryPass {
                 ]);
                 data.push(material.base_layer as f32);
                 data.push(material.normal_layer as f32);
+                data.push(material.orm_layer as f32);
+                data.push(material.emissive_layer as f32);
             }
             upload_instances(
                 context.device,
@@ -2501,6 +2511,20 @@ fn normal_pixel(layer: usize, x: usize, y: usize) -> [u8; 4] {
     [encode(cell_u), encode(cell_v), encode(1.0), 255]
 }
 
+fn orm_pixel(layer: usize, x: usize, y: usize) -> [u8; 4] {
+    let checker = ((x / 8) + (y / 8)).is_multiple_of(2);
+    let roughness = match layer {
+        1 if checker => 255,
+        1 => 70,
+        _ => 255,
+    };
+    [255, roughness, 255, 255]
+}
+
+fn emissive_pixel(_layer: usize, _x: usize, _y: usize) -> [u8; 4] {
+    [255, 255, 255, 255]
+}
+
 fn texture_array(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2758,7 +2782,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     });
     let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 7 => Float32x3];
     let instance_attrs = wgpu::vertex_attr_array![
-        2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 8 => Float32x4, 9 => Float32x2
+        2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 8 => Float32x4, 9 => Float32x4
     ];
     let mesh_buffers = [
         wgpu::VertexBufferLayout {
@@ -2767,7 +2791,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             attributes: &vertex_attrs,
         },
         wgpu::VertexBufferLayout {
-            array_stride: 104,
+            array_stride: 112,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &instance_attrs,
         },
@@ -2849,6 +2873,13 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         wgpu::TextureFormat::Rgba8Unorm,
         normal_pixel,
     );
+    let orm_array_view = texture_array(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, orm_pixel);
+    let emissive_array_view = texture_array(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        emissive_pixel,
+    );
     let (irradiance_view, prefiltered_view, brdf_view, ibl_sampler) = generate_ibl(&device, &queue);
     let geometry_bind_group = bind_group(
         &device,
@@ -2871,6 +2902,8 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             (14, wgpu::BindingResource::TextureView(&brdf_view)),
             (15, wgpu::BindingResource::Sampler(&ibl_sampler)),
             (16, wgpu::BindingResource::TextureView(&normal_array_view)),
+            (17, wgpu::BindingResource::TextureView(&orm_array_view)),
+            (18, wgpu::BindingResource::TextureView(&emissive_array_view)),
         ],
     );
     let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
