@@ -1683,6 +1683,31 @@ impl State for Demo {
                 emissive_layer: 0,
             },
         });
+
+        let grid = 50i32;
+        for x in -grid / 2..grid / 2 {
+            for z in -grid / 2..grid / 2 {
+                world.resources.commands.push(SpawnCommand {
+                    mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | MATERIAL | EMISSIVE,
+                    transform: LocalTransform {
+                        translation: nalgebra_glm::vec3(x as f32 * 1.6, 0.5, z as f32 * 1.6),
+                        scale: nalgebra_glm::vec3(0.3, 0.3, 0.3),
+                        ..Default::default()
+                    },
+                    render_mesh: 0,
+                    emissive: Vec3::zeros(),
+                    material: Material {
+                        albedo: nalgebra_glm::vec3(0.8, 0.45, 0.2),
+                        metallic: 0.1,
+                        roughness: 0.5,
+                        base_layer: 1,
+                        normal_layer: 1,
+                        orm_layer: 0,
+                        emissive_layer: 0,
+                    },
+                });
+            }
+        }
     }
 }
 
@@ -1727,6 +1752,8 @@ const FILTER_ENVMAP_SHADER: &str = include_str!("shaders/filter_envmap.wgsl");
 const BRDF_LUT_SHADER: &str = include_str!("shaders/brdf_lut.wgsl");
 
 const SKIN_COMPUTE_SHADER: &str = include_str!("shaders/skin_compute.wgsl");
+
+const MESH_CULL_SHADER: &str = include_str!("shaders/mesh_cull.wgsl");
 
 const SHADER: &str = include_str!("shaders/mesh.wgsl");
 
@@ -2197,6 +2224,10 @@ struct MeshGpu {
     vertex_count: u32,
     instance_buffer: wgpu::Buffer,
     instance_capacity: u32,
+    culled_buffer: wgpu::Buffer,
+    indirect_buffer: wgpu::Buffer,
+    bounds_buffer: wgpu::Buffer,
+    cull_buffer: wgpu::Buffer,
 }
 
 struct GeometryPass {
@@ -2229,6 +2260,7 @@ struct GeometryPass {
     skin_pipeline: wgpu::ComputePipeline,
     joint_buffer: wgpu::Buffer,
     joint_capacity: u32,
+    cull_pipeline: wgpu::ComputePipeline,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -2247,7 +2279,9 @@ fn upload_instances(
         *buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: *capacity as u64 * 112,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
     }
@@ -2792,6 +2826,39 @@ fn equirect_texture(device: &wgpu::Device, queue: &wgpu::Queue, url: &str) -> wg
     texture.create_view(&Default::default())
 }
 
+fn frustum_planes(view_projection: &Mat4) -> [f32; 24] {
+    let row = |index: usize| {
+        [
+            view_projection[(index, 0)],
+            view_projection[(index, 1)],
+            view_projection[(index, 2)],
+            view_projection[(index, 3)],
+        ]
+    };
+    let r0 = row(0);
+    let r1 = row(1);
+    let r3 = row(3);
+    let sides = [
+        [r3[0] + r0[0], r3[1] + r0[1], r3[2] + r0[2], r3[3] + r0[3]],
+        [r3[0] - r0[0], r3[1] - r0[1], r3[2] - r0[2], r3[3] - r0[3]],
+        [r3[0] + r1[0], r3[1] + r1[1], r3[2] + r1[2], r3[3] + r1[3]],
+        [r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2], r3[3] - r1[3]],
+    ];
+    let mut out = [0.0f32; 24];
+    for (index, plane) in sides.iter().enumerate() {
+        let length = (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2])
+            .sqrt()
+            .max(1e-6);
+        out[index * 4] = plane[0] / length;
+        out[index * 4 + 1] = plane[1] / length;
+        out[index * 4 + 2] = plane[2] / length;
+        out[index * 4 + 3] = plane[3] / length;
+    }
+    out[19] = 1.0e9;
+    out[23] = 1.0e9;
+    out
+}
+
 fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> MeshGpu {
     let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
@@ -2803,14 +2870,62 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 112,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let culled_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 112,
+        usage: wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut minimum = [f32::MAX; 3];
+    let mut maximum = [f32::MIN; 3];
+    for vertex in vertices.chunks_exact(11) {
+        for axis in 0..3 {
+            minimum[axis] = minimum[axis].min(vertex[axis]);
+            maximum[axis] = maximum[axis].max(vertex[axis]);
+        }
+    }
+    let center = nalgebra_glm::vec3(
+        (minimum[0] + maximum[0]) * 0.5,
+        (minimum[1] + maximum[1]) * 0.5,
+        (minimum[2] + maximum[2]) * 0.5,
+    );
+    let radius = nalgebra_glm::vec3(
+        maximum[0] - center.x,
+        maximum[1] - center.y,
+        maximum[2] - center.z,
+    )
+    .norm();
+    let bounds_buffer = uniform_buffer(device, 16);
+    queue.write_buffer(
+        &bounds_buffer,
+        0,
+        bytemuck::cast_slice(&[center.x, center.y, center.z, radius]),
+    );
+    let cull_buffer = uniform_buffer(device, 112);
     MeshGpu {
         vertex_buffer,
         vertex_count: vertices.len() as u32 / 11,
         instance_buffer,
         instance_capacity: 1,
+        culled_buffer,
+        indirect_buffer,
+        bounds_buffer,
+        cull_buffer,
     }
 }
 
@@ -3053,6 +3168,10 @@ impl PassNode for GeometryPass {
             compute.dispatch_workgroups(4, 3, 6);
         }
 
+        let frustum = frustum_planes(
+            &view_projection_matrix(context.world, context.aspect_ratio)
+                .unwrap_or_else(Mat4::identity),
+        );
         let mut counts = Vec::with_capacity(self.meshes.len());
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
             let instances = mesh_instances(context.world, handle as u32);
@@ -3081,6 +3200,53 @@ impl PassNode for GeometryPass {
                 count,
             );
             counts.push(count);
+            if count == 0 {
+                continue;
+            }
+            let needed = mesh.instance_capacity as u64 * 112;
+            if mesh.culled_buffer.size() < needed {
+                mesh.culled_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: needed,
+                    usage: wgpu::BufferUsages::VERTEX
+                        | wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            context.queue.write_buffer(
+                &mesh.indirect_buffer,
+                0,
+                bytemuck::cast_slice(&[mesh.vertex_count, 0u32, 0, 0]),
+            );
+            let mut cull_data = [0u32; 28];
+            for (index, value) in frustum.iter().enumerate() {
+                cull_data[index] = value.to_bits();
+            }
+            cull_data[24] = count;
+            context
+                .queue
+                .write_buffer(&mesh.cull_buffer, 0, bytemuck::cast_slice(&cull_data));
+            let cull_bind = bind_group(
+                context.device,
+                &self.cull_pipeline.get_bind_group_layout(0),
+                vec![
+                    (0, mesh.instance_buffer.as_entire_binding()),
+                    (1, mesh.culled_buffer.as_entire_binding()),
+                    (2, mesh.indirect_buffer.as_entire_binding()),
+                    (3, mesh.bounds_buffer.as_entire_binding()),
+                    (4, mesh.cull_buffer.as_entire_binding()),
+                ],
+            );
+            let mut cull = context
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+            cull.set_pipeline(&self.cull_pipeline);
+            cull.set_bind_group(0, &cull_bind, &[]);
+            cull.dispatch_workgroups(count.div_ceil(64), 1, 1);
         }
 
         self.render_shadow_atlas(
@@ -3297,8 +3463,8 @@ impl PassNode for GeometryPass {
         for (handle, mesh) in self.meshes.iter().enumerate() {
             if counts[handle] > 0 {
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
-                pass.draw(0..mesh.vertex_count, 0..counts[handle]);
+                pass.set_vertex_buffer(1, mesh.culled_buffer.slice(..));
+                pass.draw_indirect(&mesh.indirect_buffer, 0);
             }
         }
         for &(handle, vertex_count) in &skinned_draws {
@@ -4433,6 +4599,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let ssr = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let ldr = add_color_resource(&mut graph, false, SCENE_FORMAT, background);
     let skin_pipeline = compute_pipeline(&device, SKIN_COMPUTE_SHADER);
+    let cull_pipeline = compute_pipeline(&device, MESH_CULL_SHADER);
     let joint_buffer = storage_buffer(&device, 64);
     add_pass(
         &mut graph,
@@ -4466,6 +4633,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             skin_pipeline,
             joint_buffer,
             joint_capacity: 0,
+            cull_pipeline,
             camera_buffer,
             lights_buffer,
             bind_group: geometry_bind_group,
