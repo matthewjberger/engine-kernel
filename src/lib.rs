@@ -1809,6 +1809,7 @@ struct VertexOutput {
     @location(6) @interpolate(flat) albedo: vec3<f32>,
     @location(7) @interpolate(flat) material: vec2<f32>,
     @location(8) @interpolate(flat) base_layer: u32,
+    @location(9) uv: vec2<f32>,
 }
 struct GeometryOutput {
     @location(0) color: vec4<f32>,
@@ -1901,6 +1902,7 @@ fn lighting(
     let clip = camera.view_projection * world;
     let world_normal = (model * vec4<f32>(in.normal, 0.0)).xyz;
     let view_normal = (camera.view * vec4<f32>(world_normal, 0.0)).xyz;
+    let model_scale = vec3<f32>(length(model[0].xyz), length(model[1].xyz), length(model[2].xyz));
     return VertexOutput(
         clip,
         vec4<f32>(in.color, 1.0),
@@ -1911,15 +1913,16 @@ fn lighting(
         in.albedo_metallic.rgb,
         vec2<f32>(in.albedo_metallic.w, in.emissive.w),
         u32(in.base_layer),
+        planar_uv(in.position * model_scale, in.normal),
     );
 }
-fn planar_uv(world_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+fn planar_uv(local_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
     let axis = abs(normal);
-    var uv = world_position.xy;
+    var uv = local_position.xy;
     if axis.x >= axis.y && axis.x >= axis.z {
-        uv = world_position.zy;
+        uv = local_position.zy;
     } else if axis.y >= axis.z {
-        uv = world_position.xz;
+        uv = local_position.xz;
     }
     return uv * 0.5;
 }
@@ -1927,8 +1930,7 @@ fn planar_uv(world_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
     let emissive_surface = in.emissive.r + in.emissive.g + in.emissive.b > 0.0;
     let normal = normalize(in.world_normal);
     let view = normalize(camera.camera_position.xyz - in.world_position);
-    let uv = planar_uv(in.world_position, normal);
-    let texel = textureSample(albedo_textures, albedo_sampler, uv, in.base_layer).rgb;
+    let texel = textureSample(albedo_textures, albedo_sampler, in.uv, in.base_layer).rgb;
     let albedo = in.color.rgb * in.albedo * texel;
     let lit = lighting(albedo, in.world_position, normal, view, in.material.x, max(in.material.y, 0.04), in.position.xy);
     let shaded = select(lit, in.color.rgb * in.emissive, emissive_surface);
