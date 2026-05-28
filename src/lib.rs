@@ -1414,6 +1414,161 @@ const CUBE_VERTICES: [f32; 324] = [
     0., 0., -1.,
 ];
 
+const CLUSTER_X: u32 = 16;
+const CLUSTER_Y: u32 = 9;
+const CLUSTER_Z: u32 = 24;
+const CLUSTER_TOTAL: u32 = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
+const MAX_LIGHTS_PER_CLUSTER: u32 = 8;
+
+const CLUSTER_BOUNDS_SHADER: &str = "
+struct ClusterUniforms {
+    inverse_projection: mat4x4<f32>,
+    view: mat4x4<f32>,
+    screen_size: vec2<f32>,
+    z_near: f32,
+    z_far: f32,
+    cluster_count: vec4<u32>,
+    tile_size: vec2<f32>,
+    num_lights: u32,
+    pad: u32,
+}
+struct ClusterBounds {
+    min_point: vec4<f32>,
+    max_point: vec4<f32>,
+}
+@group(0) @binding(0) var<uniform> uniforms: ClusterUniforms;
+@group(0) @binding(1) var<storage, read_write> cluster_bounds: array<ClusterBounds>;
+fn screen_to_view(screen_coord: vec2<f32>, depth: f32) -> vec3<f32> {
+    let ndc = vec4<f32>(
+        (screen_coord.x / uniforms.screen_size.x) * 2.0 - 1.0,
+        (1.0 - screen_coord.y / uniforms.screen_size.y) * 2.0 - 1.0,
+        depth,
+        1.0,
+    );
+    let view_position = uniforms.inverse_projection * ndc;
+    return view_position.xyz / view_position.w;
+}
+fn line_intersection_with_z_plane(start: vec3<f32>, end: vec3<f32>, z: f32) -> vec3<f32> {
+    let direction = end - start;
+    let t = (z - start.z) / direction.z;
+    return start + t * direction;
+}
+fn cluster_depth_to_view_z(slice: u32) -> f32 {
+    let t = f32(slice) / f32(uniforms.cluster_count.z);
+    return -uniforms.z_near * pow(uniforms.z_far / uniforms.z_near, t);
+}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    if global_id.x >= uniforms.cluster_count.x || global_id.y >= uniforms.cluster_count.y || global_id.z >= uniforms.cluster_count.z {
+        return;
+    }
+    let tile_size = uniforms.tile_size;
+    let min_screen = vec2<f32>(f32(global_id.x) * tile_size.x, f32(global_id.y) * tile_size.y);
+    let max_screen = vec2<f32>(f32(global_id.x + 1u) * tile_size.x, f32(global_id.y + 1u) * tile_size.y);
+    let eye = vec3<f32>(0.0, 0.0, 0.0);
+    let min_view = screen_to_view(min_screen, 1.0);
+    let max_view = screen_to_view(max_screen, 1.0);
+    let near_z = cluster_depth_to_view_z(global_id.z);
+    let far_z = cluster_depth_to_view_z(global_id.z + 1u);
+    let min_near = line_intersection_with_z_plane(eye, min_view, near_z);
+    let min_far = line_intersection_with_z_plane(eye, min_view, far_z);
+    let max_near = line_intersection_with_z_plane(eye, max_view, near_z);
+    let max_far = line_intersection_with_z_plane(eye, max_view, far_z);
+    let aabb_min = min(min(min_near, min_far), min(max_near, max_far));
+    let aabb_max = max(max(min_near, min_far), max(max_near, max_far));
+    let cluster_index = global_id.x + global_id.y * uniforms.cluster_count.x + global_id.z * uniforms.cluster_count.x * uniforms.cluster_count.y;
+    cluster_bounds[cluster_index].min_point = vec4<f32>(aabb_min, 0.0);
+    cluster_bounds[cluster_index].max_point = vec4<f32>(aabb_max, 0.0);
+}
+";
+
+const CLUSTER_ASSIGN_SHADER: &str = "
+struct ClusterUniforms {
+    inverse_projection: mat4x4<f32>,
+    view: mat4x4<f32>,
+    screen_size: vec2<f32>,
+    z_near: f32,
+    z_far: f32,
+    cluster_count: vec4<u32>,
+    tile_size: vec2<f32>,
+    num_lights: u32,
+    pad: u32,
+}
+struct ClusterBounds {
+    min_point: vec4<f32>,
+    max_point: vec4<f32>,
+}
+struct LightGrid {
+    offset: u32,
+    count: u32,
+}
+struct ClusterLight {
+    position: vec4<f32>,
+    direction: vec4<f32>,
+}
+@group(0) @binding(0) var<uniform> uniforms: ClusterUniforms;
+@group(0) @binding(1) var<storage, read> cluster_bounds: array<ClusterBounds>;
+@group(0) @binding(2) var<storage, read_write> light_grid: array<LightGrid>;
+@group(0) @binding(3) var<storage, read_write> light_indices: array<u32>;
+@group(0) @binding(4) var<storage, read> lights: array<ClusterLight>;
+fn sphere_aabb(center: vec3<f32>, radius: f32, aabb_min: vec3<f32>, aabb_max: vec3<f32>) -> bool {
+    let closest = clamp(center, aabb_min, aabb_max);
+    let offset = closest - center;
+    return dot(offset, offset) <= radius * radius;
+}
+fn cone_aabb(tip: vec3<f32>, direction: vec3<f32>, range: f32, angle_cos: f32, aabb_min: vec3<f32>, aabb_max: vec3<f32>) -> bool {
+    if !sphere_aabb(tip, range, aabb_min, aabb_max) {
+        return false;
+    }
+    let center = (aabb_min + aabb_max) * 0.5;
+    let radius = length((aabb_max - aabb_min) * 0.5);
+    let to_center = center - tip;
+    let along = dot(to_center, direction);
+    if along < 0.0 {
+        return length(to_center) <= radius;
+    }
+    if along > range + radius {
+        return false;
+    }
+    let on_axis = tip + direction * along;
+    let perpendicular = length(center - on_axis);
+    let cone_radius = along * sqrt(1.0 - angle_cos * angle_cos) / angle_cos;
+    return perpendicular <= cone_radius + radius;
+}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    if global_id.x >= uniforms.cluster_count.x || global_id.y >= uniforms.cluster_count.y || global_id.z >= uniforms.cluster_count.z {
+        return;
+    }
+    let cluster_index = global_id.x + global_id.y * uniforms.cluster_count.x + global_id.z * uniforms.cluster_count.x * uniforms.cluster_count.y;
+    let bounds = cluster_bounds[cluster_index];
+    let aabb_min = bounds.min_point.xyz;
+    let aabb_max = bounds.max_point.xyz;
+    let base = cluster_index * uniforms.cluster_count.w;
+    var count = 0u;
+    for (var light_index = 0u; light_index < uniforms.num_lights; light_index = light_index + 1u) {
+        let light = lights[light_index];
+        let view_position = (uniforms.view * vec4<f32>(light.position.xyz, 1.0)).xyz;
+        let range = light.position.w;
+        var intersects = false;
+        if range <= 0.0 {
+            intersects = true;
+        } else if light.direction.w < -1.5 {
+            intersects = sphere_aabb(view_position, range, aabb_min, aabb_max);
+        } else {
+            let view_direction = normalize((uniforms.view * vec4<f32>(light.direction.xyz, 0.0)).xyz);
+            intersects = cone_aabb(view_position, view_direction, range, light.direction.w, aabb_min, aabb_max);
+        }
+        if intersects && count < uniforms.cluster_count.w {
+            light_indices[base + count] = light_index;
+            count = count + 1u;
+        }
+    }
+    light_grid[cluster_index].offset = base;
+    light_grid[cluster_index].count = count;
+}
+";
+
 const SHADER: &str = "
 struct Camera {
     view_projection: mat4x4<f32>,
@@ -1441,6 +1596,21 @@ struct SpotShadow {
     view_projection: array<mat4x4<f32>, 4>,
     atlas_rect: array<vec4<f32>, 4>,
 }
+struct ClusterUniforms {
+    inverse_projection: mat4x4<f32>,
+    view: mat4x4<f32>,
+    screen_size: vec2<f32>,
+    z_near: f32,
+    z_far: f32,
+    cluster_count: vec4<u32>,
+    tile_size: vec2<f32>,
+    num_lights: u32,
+    pad: u32,
+}
+struct LightGrid {
+    offset: u32,
+    count: u32,
+}
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<uniform> lights: Lights;
 @group(0) @binding(2) var shadow_texture: texture_depth_2d;
@@ -1448,6 +1618,21 @@ struct SpotShadow {
 @group(0) @binding(4) var<uniform> shadow: Shadow;
 @group(0) @binding(5) var spotlight_atlas: texture_depth_2d;
 @group(0) @binding(6) var<uniform> spot_shadow: SpotShadow;
+@group(0) @binding(7) var<uniform> cluster: ClusterUniforms;
+@group(0) @binding(8) var<storage, read> light_grid: array<LightGrid>;
+@group(0) @binding(9) var<storage, read> light_indices: array<u32>;
+
+fn get_cluster_index(frag_coord: vec2<f32>, view_depth: f32) -> u32 {
+    let tile_x = u32(frag_coord.x / cluster.tile_size.x);
+    let tile_y = u32(frag_coord.y / cluster.tile_size.y);
+    let log_ratio = log(cluster.z_far / cluster.z_near);
+    let safe_depth = max(view_depth, cluster.z_near);
+    let slice = u32(log(safe_depth / cluster.z_near) / log_ratio * f32(cluster.cluster_count.z));
+    let clamped_slice = clamp(slice, 0u, cluster.cluster_count.z - 1u);
+    let clamped_x = clamp(tile_x, 0u, cluster.cluster_count.x - 1u);
+    let clamped_y = clamp(tile_y, 0u, cluster.cluster_count.y - 1u);
+    return clamped_x + clamped_y * cluster.cluster_count.x + clamped_slice * cluster.cluster_count.x * cluster.cluster_count.y;
+}
 
 const POISSON_8: array<vec2<f32>, 8> = array<vec2<f32>, 8>(
     vec2<f32>(-0.7071, -0.7071),
@@ -1676,6 +1861,7 @@ fn lighting(
     view: vec3<f32>,
     metallic: f32,
     roughness: f32,
+    frag_coord: vec2<f32>,
 ) -> vec3<f32> {
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
     var color = lights.ambient.rgb * albedo;
@@ -1683,8 +1869,9 @@ fn lighting(
     let view_depth = -(camera.view * vec4<f32>(world_position, 1.0)).z;
     let sun_shadow = calculate_shadow(world_position, normal, view_depth);
     color += brdf(normal, view, sun, lights.sun_color.rgb * sun_shadow, albedo, metallic, roughness, f0);
-    let count = u32(lights.point_count.x);
-    for (var index = 0u; index < count; index = index + 1u) {
+    let grid = light_grid[get_cluster_index(frag_coord, view_depth)];
+    for (var slot = 0u; slot < grid.count; slot = slot + 1u) {
+        let index = light_indices[grid.offset + slot];
         let to_light = lights.point_position[index].xyz - world_position;
         let distance = max(length(to_light), 0.0001);
         let attenuation = range_attenuation(lights.point_position[index].w, distance);
@@ -1722,7 +1909,7 @@ fn lighting(
     let normal = normalize(in.world_normal);
     let view = normalize(camera.camera_position.xyz - in.world_position);
     let albedo = in.color.rgb * in.albedo;
-    let lit = lighting(albedo, in.world_position, normal, view, in.material.x, max(in.material.y, 0.04));
+    let lit = lighting(albedo, in.world_position, normal, view, in.material.x, max(in.material.y, 0.04), in.position.xy);
     let shaded = select(lit, in.color.rgb * in.emissive, emissive_surface);
     var out: GeometryOutput;
     out.color = vec4<f32>(shaded, 1.0);
@@ -1925,6 +2112,7 @@ struct PassContext<'a> {
     encoder: &'a mut wgpu::CommandEncoder,
     world: &'a World,
     aspect_ratio: f32,
+    size: (u32, u32),
     resources: &'a [ResourceDesc],
     views: &'a [Option<&'a wgpu::TextureView>],
     bindings: &'a HashMap<&'static str, usize>,
@@ -2281,6 +2469,7 @@ fn render_graph_execute(
             encoder: &mut encoder,
             world,
             aspect_ratio,
+            size,
             resources: &graph.resources,
             views: &views,
             bindings: &bindings,
@@ -2311,6 +2500,12 @@ struct GeometryPass {
     spot_buffers: [wgpu::Buffer; 4],
     spot_bind_groups: [wgpu::BindGroup; 4],
     spot_shadow_buffer: wgpu::Buffer,
+    cluster_uniform_buffer: wgpu::Buffer,
+    cluster_lights_buffer: wgpu::Buffer,
+    cluster_bounds_pipeline: wgpu::ComputePipeline,
+    cluster_bounds_bind_group: wgpu::BindGroup,
+    cluster_assign_pipeline: wgpu::ComputePipeline,
+    cluster_assign_bind_group: wgpu::BindGroup,
     meshes: Vec<MeshGpu>,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
@@ -2447,6 +2642,70 @@ impl PassNode for GeometryPass {
             0,
             bytemuck::cast_slice(&spot_shadow_data),
         );
+
+        let projection =
+            camera_projection(context.world, context.aspect_ratio).unwrap_or_else(Mat4::identity);
+        let inverse_projection = nalgebra_glm::inverse(&projection);
+        let screen_width = context.size.0.max(1) as f32;
+        let screen_height = context.size.1.max(1) as f32;
+        let point_count = lights[12] as u32;
+        let mut cluster_lights = [0.0f32; 64];
+        for index in 0..point_count as usize {
+            cluster_lights[index * 8..index * 8 + 4]
+                .copy_from_slice(&lights[16 + index * 4..16 + index * 4 + 4]);
+            cluster_lights[index * 8 + 4..index * 8 + 8]
+                .copy_from_slice(&lights[80 + index * 4..80 + index * 4 + 4]);
+        }
+        context.queue.write_buffer(
+            &self.cluster_lights_buffer,
+            0,
+            bytemuck::cast_slice(&cluster_lights),
+        );
+        let mut cluster_data = [0u32; 44];
+        for (index, value) in inverse_projection.as_slice().iter().enumerate() {
+            cluster_data[index] = value.to_bits();
+        }
+        for (index, value) in view.as_slice().iter().enumerate() {
+            cluster_data[16 + index] = value.to_bits();
+        }
+        cluster_data[32] = screen_width.to_bits();
+        cluster_data[33] = screen_height.to_bits();
+        cluster_data[34] = 0.1f32.to_bits();
+        cluster_data[35] = 100.0f32.to_bits();
+        cluster_data[36] = CLUSTER_X;
+        cluster_data[37] = CLUSTER_Y;
+        cluster_data[38] = CLUSTER_Z;
+        cluster_data[39] = MAX_LIGHTS_PER_CLUSTER;
+        cluster_data[40] = (screen_width / CLUSTER_X as f32).to_bits();
+        cluster_data[41] = (screen_height / CLUSTER_Y as f32).to_bits();
+        cluster_data[42] = point_count;
+        context.queue.write_buffer(
+            &self.cluster_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&cluster_data),
+        );
+        {
+            let mut compute = context
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+            compute.set_pipeline(&self.cluster_bounds_pipeline);
+            compute.set_bind_group(0, &self.cluster_bounds_bind_group, &[]);
+            compute.dispatch_workgroups(4, 3, 6);
+        }
+        {
+            let mut compute = context
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+            compute.set_pipeline(&self.cluster_assign_pipeline);
+            compute.set_bind_group(0, &self.cluster_assign_bind_group, &[]);
+            compute.dispatch_workgroups(4, 3, 6);
+        }
 
         let mut counts = Vec::with_capacity(self.meshes.len());
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
@@ -2874,6 +3133,30 @@ fn uniform_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
     })
 }
 
+fn storage_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn compute_pipeline(device: &wgpu::Device, source: &str) -> wgpu::ComputePipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
 fn bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -3058,6 +3341,14 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let lights_buffer = uniform_buffer(&device, 576);
     let shadow_buffer = uniform_buffer(&device, 368);
     let spot_shadow_buffer = uniform_buffer(&device, 320);
+    let cluster_uniform_buffer = uniform_buffer(&device, 176);
+    let cluster_bounds_buffer = storage_buffer(&device, CLUSTER_TOTAL as u64 * 32);
+    let light_grid_buffer = storage_buffer(&device, CLUSTER_TOTAL as u64 * 8);
+    let light_indices_buffer = storage_buffer(
+        &device,
+        CLUSTER_TOTAL as u64 * MAX_LIGHTS_PER_CLUSTER as u64 * 4,
+    );
+    let cluster_lights_buffer = storage_buffer(&device, 8 * 32);
     let geometry_bind_group = bind_group(
         &device,
         &pipeline.get_bind_group_layout(0),
@@ -3069,6 +3360,30 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             (4, shadow_buffer.as_entire_binding()),
             (5, wgpu::BindingResource::TextureView(&spot_atlas_view)),
             (6, spot_shadow_buffer.as_entire_binding()),
+            (7, cluster_uniform_buffer.as_entire_binding()),
+            (8, light_grid_buffer.as_entire_binding()),
+            (9, light_indices_buffer.as_entire_binding()),
+        ],
+    );
+    let cluster_bounds_pipeline = compute_pipeline(&device, CLUSTER_BOUNDS_SHADER);
+    let cluster_bounds_bind_group = bind_group(
+        &device,
+        &cluster_bounds_pipeline.get_bind_group_layout(0),
+        vec![
+            (0, cluster_uniform_buffer.as_entire_binding()),
+            (1, cluster_bounds_buffer.as_entire_binding()),
+        ],
+    );
+    let cluster_assign_pipeline = compute_pipeline(&device, CLUSTER_ASSIGN_SHADER);
+    let cluster_assign_bind_group = bind_group(
+        &device,
+        &cluster_assign_pipeline.get_bind_group_layout(0),
+        vec![
+            (0, cluster_uniform_buffer.as_entire_binding()),
+            (1, cluster_bounds_buffer.as_entire_binding()),
+            (2, light_grid_buffer.as_entire_binding()),
+            (3, light_indices_buffer.as_entire_binding()),
+            (4, cluster_lights_buffer.as_entire_binding()),
         ],
     );
     let cascade_buffers: [wgpu::Buffer; 4] = std::array::from_fn(|_| uniform_buffer(&device, 64));
@@ -3142,6 +3457,12 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             spot_buffers,
             spot_bind_groups,
             spot_shadow_buffer,
+            cluster_uniform_buffer,
+            cluster_lights_buffer,
+            cluster_bounds_pipeline,
+            cluster_bounds_bind_group,
+            cluster_assign_pipeline,
+            cluster_assign_bind_group,
             meshes,
             camera_buffer,
             lights_buffer,
