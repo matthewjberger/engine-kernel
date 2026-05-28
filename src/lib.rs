@@ -935,6 +935,21 @@ fn camera_projection(world: &World, aspect_ratio: f32) -> Option<Mat4> {
     Some(perspective_matrix(&camera.projection, aspect_ratio))
 }
 
+fn sun_view_projection(direction: Vec3) -> Mat4 {
+    let direction = if direction.magnitude() < 0.001 {
+        nalgebra_glm::vec3(0.3, 0.8, 0.5)
+    } else {
+        direction.normalize()
+    };
+    let up = if direction.y.abs() > 0.99 {
+        Vec3::z()
+    } else {
+        Vec3::y()
+    };
+    let view = nalgebra_glm::look_at(&(direction * 18.0), &Vec3::zeros(), &up);
+    nalgebra_glm::ortho_rh_zo(-14.0, 14.0, -14.0, 14.0, 0.1, 40.0) * view
+}
+
 fn view_projection_matrix(world: &World, aspect_ratio: f32) -> Option<Mat4> {
     Some(camera_projection(world, aspect_ratio)? * camera_view(world)?)
 }
@@ -1162,6 +1177,7 @@ const SHADER: &str = "
 struct Camera {
     view_projection: mat4x4<f32>,
     view: mat4x4<f32>,
+    sun_view_projection: mat4x4<f32>,
 }
 struct Lights {
     ambient: vec4<f32>,
@@ -1173,7 +1189,19 @@ struct Lights {
 }
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<uniform> lights: Lights;
+@group(0) @binding(2) var shadow_texture: texture_depth_2d;
+@group(0) @binding(3) var shadow_sampler: sampler_comparison;
 @group(1) @binding(0) var<storage, read> tints: array<vec4<f32>, 64>;
+
+fn shadow_factor(world_position: vec3<f32>, n_dot_l: f32) -> f32 {
+    let light_clip = camera.sun_view_projection * vec4<f32>(world_position, 1.0);
+    let ndc = light_clip.xyz / light_clip.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * -0.5 + 0.5);
+    let bias = max(0.0025 * (1.0 - n_dot_l), 0.0006);
+    let lit = textureSampleCompareLevel(shadow_texture, shadow_sampler, uv, ndc.z - bias);
+    let inside = ndc.z <= 1.0 && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+    return select(1.0, lit, inside);
+}
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -1200,7 +1228,8 @@ struct GeometryOutput {
 }
 fn lighting(albedo: vec3<f32>, world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     var radiance = lights.ambient.rgb;
-    radiance += lights.sun_color.rgb * max(dot(normal, lights.sun_direction.xyz), 0.0);
+    let n_dot_sun = max(dot(normal, lights.sun_direction.xyz), 0.0);
+    radiance += lights.sun_color.rgb * n_dot_sun * shadow_factor(world_position, n_dot_sun);
     let count = u32(lights.point_count.x);
     for (var index = 0u; index < count; index = index + 1u) {
         let to_light = lights.point_position[index].xyz - world_position;
@@ -1240,6 +1269,26 @@ fn lighting(albedo: vec3<f32>, world_position: vec3<f32>, normal: vec3<f32>) -> 
     out.color = vec4<f32>(shaded, 1.0);
     out.normal = vec4<f32>(normalize(in.view_normal), 1.0);
     return out;
+}
+";
+
+const SHADOW_SHADER: &str = "
+struct Camera {
+    view_projection: mat4x4<f32>,
+    view: mat4x4<f32>,
+    sun_view_projection: mat4x4<f32>,
+}
+@group(0) @binding(0) var<uniform> camera: Camera;
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(2) model_0: vec4<f32>,
+    @location(3) model_1: vec4<f32>,
+    @location(4) model_2: vec4<f32>,
+    @location(5) model_3: vec4<f32>,
+}
+@vertex fn vs(in: VertexInput) -> @builtin(position) vec4<f32> {
+    let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
+    return camera.sun_view_projection * model * vec4<f32>(in.position, 1.0);
 }
 ";
 
@@ -1872,6 +1921,9 @@ struct MeshGpu {
 
 struct GeometryPass {
     pipeline: wgpu::RenderPipeline,
+    shadow_pipeline: wgpu::RenderPipeline,
+    shadow_view: wgpu::TextureView,
+    shadow_bind_group: wgpu::BindGroup,
     meshes: Vec<MeshGpu>,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
@@ -1940,14 +1992,17 @@ impl PassNode for GeometryPass {
         let view_projection = view_projection_matrix(context.world, context.aspect_ratio)
             .unwrap_or_else(Mat4::identity);
         let view = camera_view(context.world).unwrap_or_else(Mat4::identity);
-        let mut camera_data = [0.0f32; 32];
+
+        let lights = gather_lights(context.world);
+        let sun = nalgebra_glm::vec3(lights[4], lights[5], lights[6]);
+        let sun_view_projection = sun_view_projection(sun);
+        let mut camera_data = [0.0f32; 48];
         camera_data[..16].copy_from_slice(view_projection.as_slice());
-        camera_data[16..].copy_from_slice(view.as_slice());
+        camera_data[16..32].copy_from_slice(view.as_slice());
+        camera_data[32..].copy_from_slice(sun_view_projection.as_slice());
         context
             .queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&camera_data));
-
-        let lights = gather_lights(context.world);
         context
             .queue
             .write_buffer(&self.lights_buffer, 0, bytemuck::cast_slice(&lights));
@@ -1983,6 +2038,32 @@ impl PassNode for GeometryPass {
                     resource: tints.as_entire_binding(),
                 }],
             });
+
+        {
+            let mut shadow_pass = context
+                .encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.shadow_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+            shadow_pass.set_pipeline(&self.shadow_pipeline);
+            shadow_pass.set_bind_group(0, &self.shadow_bind_group, &[]);
+            for (handle, mesh) in self.meshes.iter().enumerate() {
+                if counts[handle] > 0 {
+                    shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    shadow_pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
+                    shadow_pass.draw(0..mesh.vertex_count, 0..counts[handle]);
+                }
+            }
+        }
 
         let (color_view, color_load, color_store) = color_attachment(context, "color");
         let (normal_view, normal_load, normal_store) = color_attachment(context, "normals");
@@ -2473,6 +2554,65 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         cache: None,
     });
 
+    let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(SHADOW_SHADER.into()),
+    });
+    let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &shadow_shader,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: 36,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &vertex_attrs,
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: 80,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &instance_attrs,
+                },
+            ],
+        },
+        fragment: None,
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 2048,
+            height: 2048,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let shadow_view = shadow_texture.create_view(&Default::default());
+    let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        compare: Some(wgpu::CompareFunction::LessEqual),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
     let bright_pipeline = fullscreen_pipeline(&device, BRIGHT_SHADER, SCENE_FORMAT);
     let bright_bind_group_layout = bright_pipeline.get_bind_group_layout(0);
 
@@ -2491,7 +2631,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
 
     let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 128,
+        size: 192,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -2513,7 +2653,23 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
                 binding: 1,
                 resource: lights_buffer.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&shadow_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+            },
         ],
+    });
+    let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &shadow_pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: camera_buffer.as_entire_binding(),
+        }],
     });
     let tint_bind_group_layout = pipeline.get_bind_group_layout(1);
 
@@ -2598,6 +2754,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         &mut graph,
         Box::new(GeometryPass {
             pipeline,
+            shadow_pipeline,
+            shadow_view,
+            shadow_bind_group,
             meshes,
             camera_buffer,
             lights_buffer,
