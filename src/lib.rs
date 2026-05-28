@@ -2031,16 +2031,11 @@ impl PassNode for GeometryPass {
         }
 
         let tints = graph_buffer(context, "tints");
-        let tint_bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.tint_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: tints.as_entire_binding(),
-                }],
-            });
+        let tint_bind_group = bind_group(
+            context.device,
+            &self.tint_bind_group_layout,
+            vec![(0, tints.as_entire_binding())],
+        );
 
         {
             let mut shadow_pass = context
@@ -2134,22 +2129,14 @@ impl PassNode for BrightPass {
 
     fn execute(&mut self, context: &mut PassContext) {
         let scene_view = read_view(context, "scene");
-        let bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(scene_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
+        let bind_group = bind_group(
+            context.device,
+            &self.bind_group_layout,
+            vec![
+                (0, wgpu::BindingResource::TextureView(scene_view)),
+                (1, wgpu::BindingResource::Sampler(&self.sampler)),
+            ],
+        );
 
         fullscreen_pass(context, &self.pipeline, &bind_group, "bright");
     }
@@ -2173,26 +2160,15 @@ impl PassNode for BlurPass {
 
     fn execute(&mut self, context: &mut PassContext) {
         let input_view = read_view(context, "input");
-        let bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(input_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.axis_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+        let bind_group = bind_group(
+            context.device,
+            &self.bind_group_layout,
+            vec![
+                (0, wgpu::BindingResource::TextureView(input_view)),
+                (1, wgpu::BindingResource::Sampler(&self.sampler)),
+                (2, self.axis_buffer.as_entire_binding()),
+            ],
+        );
 
         fullscreen_pass(context, &self.pipeline, &bind_group, "output");
     }
@@ -2226,26 +2202,15 @@ impl PassNode for SsaoPass {
 
         let depth_view = read_view(context, "depth");
         let normal_view = read_view(context, "normals");
-        let bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(depth_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(normal_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.data_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+        let bind_group = bind_group(
+            context.device,
+            &self.bind_group_layout,
+            vec![
+                (0, wgpu::BindingResource::TextureView(depth_view)),
+                (1, wgpu::BindingResource::TextureView(normal_view)),
+                (2, self.data_buffer.as_entire_binding()),
+            ],
+        );
 
         fullscreen_pass(context, &self.pipeline, &bind_group, "ao_raw");
     }
@@ -2269,26 +2234,15 @@ impl PassNode for SsaoBlurPass {
         let ao_view = read_view(context, "ao_raw");
         let depth_view = read_view(context, "depth");
         let normal_view = read_view(context, "normals");
-        let bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(ao_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(depth_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(normal_view),
-                    },
-                ],
-            });
+        let bind_group = bind_group(
+            context.device,
+            &self.bind_group_layout,
+            vec![
+                (0, wgpu::BindingResource::TextureView(ao_view)),
+                (1, wgpu::BindingResource::TextureView(depth_view)),
+                (2, wgpu::BindingResource::TextureView(normal_view)),
+            ],
+        );
 
         fullscreen_pass(context, &self.pipeline, &bind_group, "ao");
     }
@@ -2325,34 +2279,17 @@ impl PassNode for CompositePass {
         let scene_view = read_view(context, "scene");
         let bloom_view = read_view(context, "bloom");
         let ao_view = read_view(context, "ao");
-        let bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(scene_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(bloom_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(ao_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: self.params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+        let bind_group = bind_group(
+            context.device,
+            &self.bind_group_layout,
+            vec![
+                (0, wgpu::BindingResource::TextureView(scene_view)),
+                (1, wgpu::BindingResource::Sampler(&self.sampler)),
+                (2, wgpu::BindingResource::TextureView(bloom_view)),
+                (3, wgpu::BindingResource::TextureView(ao_view)),
+                (4, self.params_buffer.as_entire_binding()),
+            ],
+        );
 
         fullscreen_pass(context, &self.pipeline, &bind_group, "color");
     }
@@ -2378,22 +2315,14 @@ impl PassNode for ComputeTintPass {
             .write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&params));
 
         let tints = graph_buffer(context, "tints");
-        let bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: tints.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+        let bind_group = bind_group(
+            context.device,
+            &self.bind_group_layout,
+            vec![
+                (0, tints.as_entire_binding()),
+                (1, self.params_buffer.as_entire_binding()),
+            ],
+        );
 
         let mut pass = context
             .encoder
@@ -2494,13 +2423,33 @@ fn linear_sampler(device: &wgpu::Device) -> wgpu::Sampler {
     })
 }
 
-fn axis_buffer(device: &wgpu::Device, queue: &wgpu::Queue, axis: [f32; 4]) -> wgpu::Buffer {
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+fn uniform_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 16,
+        size,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
-    });
+    })
+}
+
+fn bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    entries: Vec<(u32, wgpu::BindingResource)>,
+) -> wgpu::BindGroup {
+    let entries: Vec<wgpu::BindGroupEntry> = entries
+        .into_iter()
+        .map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource })
+        .collect();
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout,
+        entries: &entries,
+    })
+}
+
+fn axis_buffer(device: &wgpu::Device, queue: &wgpu::Queue, axis: [f32; 4]) -> wgpu::Buffer {
+    let buffer = uniform_buffer(device, 16);
     queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&axis));
     buffer
 }
@@ -2642,60 +2591,30 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
 
     let composite_pipeline = fullscreen_pipeline(&device, COMPOSITE_SHADER, surface_config.format);
     let composite_bind_group_layout = composite_pipeline.get_bind_group_layout(0);
-    let composite_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 16,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let composite_params_buffer = uniform_buffer(&device, 16);
 
     let meshes = vec![
         mesh_gpu(&device, &queue, &TRIANGLE_VERTICES),
         mesh_gpu(&device, &queue, &CUBE_VERTICES),
     ];
 
-    let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 192,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 320,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &pipeline.get_bind_group_layout(0),
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: lights_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(&shadow_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-            },
+    let camera_buffer = uniform_buffer(&device, 192);
+    let lights_buffer = uniform_buffer(&device, 320);
+    let geometry_bind_group = bind_group(
+        &device,
+        &pipeline.get_bind_group_layout(0),
+        vec![
+            (0, camera_buffer.as_entire_binding()),
+            (1, lights_buffer.as_entire_binding()),
+            (2, wgpu::BindingResource::TextureView(&shadow_view)),
+            (3, wgpu::BindingResource::Sampler(&shadow_sampler)),
         ],
-    });
-    let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &shadow_pipeline.get_bind_group_layout(0),
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: camera_buffer.as_entire_binding(),
-        }],
-    });
+    );
+    let shadow_bind_group = bind_group(
+        &device,
+        &shadow_pipeline.get_bind_group_layout(0),
+        vec![(0, camera_buffer.as_entire_binding())],
+    );
     let tint_bind_group_layout = pipeline.get_bind_group_layout(1);
 
     let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2711,21 +2630,11 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         cache: None,
     });
     let compute_bind_group_layout = compute_pipeline.get_bind_group_layout(0);
-    let compute_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 16,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let compute_params_buffer = uniform_buffer(&device, 16);
 
     let ssao_pipeline = fullscreen_pipeline(&device, SSAO_SHADER, SCENE_FORMAT);
     let ssao_bind_group_layout = ssao_pipeline.get_bind_group_layout(0);
-    let ssao_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 80,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let ssao_data_buffer = uniform_buffer(&device, 80);
 
     let ssao_blur_pipeline = fullscreen_pipeline(&device, SSAO_BLUR_SHADER, SCENE_FORMAT);
     let ssao_blur_bind_group_layout = ssao_blur_pipeline.get_bind_group_layout(0);
@@ -2785,7 +2694,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             meshes,
             camera_buffer,
             lights_buffer,
-            bind_group,
+            bind_group: geometry_bind_group,
             tint_bind_group_layout,
         }),
         &[
