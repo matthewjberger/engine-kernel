@@ -103,6 +103,7 @@ struct Material {
     albedo: Vec3,
     metallic: f32,
     roughness: f32,
+    base_layer: u32,
 }
 
 impl Default for Material {
@@ -111,6 +112,7 @@ impl Default for Material {
             albedo: Vec3::new(1.0, 1.0, 1.0),
             metallic: 0.0,
             roughness: 0.6,
+            base_layer: 0,
         }
     }
 }
@@ -1356,6 +1358,7 @@ impl State for Demo {
                     albedo: nalgebra_glm::vec3(1.0, 1.0, 1.0),
                     metallic: 0.85,
                     roughness: 0.35,
+                    base_layer: 1,
                 },
             });
         }
@@ -1384,6 +1387,7 @@ impl State for Demo {
                 albedo: nalgebra_glm::vec3(0.7, 0.7, 0.7),
                 metallic: 0.0,
                 roughness: 0.9,
+                base_layer: 2,
             },
         });
     }
@@ -1621,6 +1625,8 @@ struct LightGrid {
 @group(0) @binding(7) var<uniform> cluster: ClusterUniforms;
 @group(0) @binding(8) var<storage, read> light_grid: array<LightGrid>;
 @group(0) @binding(9) var<storage, read> light_indices: array<u32>;
+@group(0) @binding(10) var albedo_textures: texture_2d_array<f32>;
+@group(0) @binding(11) var albedo_sampler: sampler;
 
 fn get_cluster_index(frag_coord: vec2<f32>, view_depth: f32) -> u32 {
     let tile_x = u32(frag_coord.x / cluster.tile_size.x);
@@ -1791,6 +1797,7 @@ struct VertexInput {
     @location(5) model_3: vec4<f32>,
     @location(6) emissive: vec4<f32>,
     @location(8) albedo_metallic: vec4<f32>,
+    @location(9) base_layer: f32,
 }
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -1801,6 +1808,7 @@ struct VertexOutput {
     @location(5) world_normal: vec3<f32>,
     @location(6) @interpolate(flat) albedo: vec3<f32>,
     @location(7) @interpolate(flat) material: vec2<f32>,
+    @location(8) @interpolate(flat) base_layer: u32,
 }
 struct GeometryOutput {
     @location(0) color: vec4<f32>,
@@ -1902,13 +1910,26 @@ fn lighting(
         world_normal,
         in.albedo_metallic.rgb,
         vec2<f32>(in.albedo_metallic.w, in.emissive.w),
+        u32(in.base_layer),
     );
+}
+fn planar_uv(world_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+    let axis = abs(normal);
+    var uv = world_position.xy;
+    if axis.x >= axis.y && axis.x >= axis.z {
+        uv = world_position.zy;
+    } else if axis.y >= axis.z {
+        uv = world_position.xz;
+    }
+    return uv * 0.5;
 }
 @fragment fn fs(in: VertexOutput) -> GeometryOutput {
     let emissive_surface = in.emissive.r + in.emissive.g + in.emissive.b > 0.0;
     let normal = normalize(in.world_normal);
     let view = normalize(camera.camera_position.xyz - in.world_position);
-    let albedo = in.color.rgb * in.albedo;
+    let uv = planar_uv(in.world_position, normal);
+    let texel = textureSample(albedo_textures, albedo_sampler, uv, in.base_layer).rgb;
+    let albedo = in.color.rgb * in.albedo * texel;
     let lit = lighting(albedo, in.world_position, normal, view, in.material.x, max(in.material.y, 0.04), in.position.xy);
     let shaded = select(lit, in.color.rgb * in.emissive, emissive_surface);
     var out: GeometryOutput;
@@ -2524,7 +2545,7 @@ fn upload_instances(
         *capacity = count.next_power_of_two();
         *buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: *capacity as u64 * 96,
+            size: *capacity as u64 * 100,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2544,7 +2565,7 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
     queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 96,
+        size: 100,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -2711,7 +2732,7 @@ impl PassNode for GeometryPass {
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
             let instances = mesh_instances(context.world, handle as u32);
             let count = instances.len() as u32;
-            let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 24);
+            let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 25);
             for (model, emissive, material) in &instances {
                 data.extend_from_slice(model.as_slice());
                 data.extend_from_slice(&[emissive.x, emissive.y, emissive.z, material.roughness]);
@@ -2721,6 +2742,7 @@ impl PassNode for GeometryPass {
                     material.albedo.z,
                     material.metallic,
                 ]);
+                data.push(material.base_layer as f32);
             }
             upload_instances(
                 context.device,
@@ -3157,6 +3179,81 @@ fn compute_pipeline(device: &wgpu::Device, source: &str) -> wgpu::ComputePipelin
     })
 }
 
+fn albedo_texture_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::TextureView, wgpu::Sampler) {
+    let size = 64u32;
+    let layers = 4u32;
+    let mut pixels = vec![0u8; (size * size * layers * 4) as usize];
+    for layer in 0..layers as usize {
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let index = (layer * (size * size) as usize + y * size as usize + x) * 4;
+                let checker = ((x / 8) + (y / 8)) % 2 == 0;
+                let (r, g, b) = match layer {
+                    1 if checker => (230u8, 120u8, 40u8),
+                    1 => (60, 30, 15),
+                    2 if checker => (185, 185, 195),
+                    2 => (120, 120, 130),
+                    3 if checker => (40, 120, 200),
+                    3 => (15, 30, 60),
+                    _ => (255, 255, 255),
+                };
+                pixels[index] = r;
+                pixels[index + 1] = g;
+                pixels[index + 2] = b;
+                pixels[index + 3] = 255;
+            }
+        }
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: layers,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(size * 4),
+            rows_per_image: Some(size),
+        },
+        wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: layers,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    (view, sampler)
+}
+
 fn bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -3206,7 +3303,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     });
     let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 7 => Float32x3];
     let instance_attrs = wgpu::vertex_attr_array![
-        2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 8 => Float32x4
+        2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 8 => Float32x4, 9 => Float32
     ];
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
@@ -3222,7 +3319,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
                     attributes: &vertex_attrs,
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: 96,
+                    array_stride: 100,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &instance_attrs,
                 },
@@ -3265,7 +3362,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
                     attributes: &vertex_attrs,
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: 96,
+                    array_stride: 100,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &instance_attrs,
                 },
@@ -3349,6 +3446,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         CLUSTER_TOTAL as u64 * MAX_LIGHTS_PER_CLUSTER as u64 * 4,
     );
     let cluster_lights_buffer = storage_buffer(&device, 8 * 32);
+    let (albedo_array_view, albedo_array_sampler) = albedo_texture_array(&device, &queue);
     let geometry_bind_group = bind_group(
         &device,
         &pipeline.get_bind_group_layout(0),
@@ -3363,6 +3461,8 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             (7, cluster_uniform_buffer.as_entire_binding()),
             (8, light_grid_buffer.as_entire_binding()),
             (9, light_indices_buffer.as_entire_binding()),
+            (10, wgpu::BindingResource::TextureView(&albedo_array_view)),
+            (11, wgpu::BindingResource::Sampler(&albedo_array_sampler)),
         ],
     );
     let cluster_bounds_pipeline = compute_pipeline(&device, CLUSTER_BOUNDS_SHADER);
