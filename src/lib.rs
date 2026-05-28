@@ -123,6 +123,153 @@ impl Default for Material {
     }
 }
 
+#[derive(Clone, Default)]
+struct Skin {
+    joints: Vec<Entity>,
+    inverse_bind: Vec<Mat4>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SkinnedMesh(u32);
+
+#[derive(Clone, Copy, PartialEq)]
+enum AnimationProperty {
+    Translation,
+    Rotation,
+    Scale,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Interpolation {
+    Linear,
+    Step,
+}
+
+#[derive(Clone)]
+enum SamplerOutput {
+    Vec3(Vec<Vec3>),
+    Quat(Vec<Quat>),
+}
+
+#[derive(Clone)]
+struct AnimationSampler {
+    input: Vec<f32>,
+    output: SamplerOutput,
+    interpolation: Interpolation,
+}
+
+#[derive(Clone)]
+struct AnimationChannel {
+    target_node: usize,
+    property: AnimationProperty,
+    sampler: AnimationSampler,
+}
+
+#[derive(Clone)]
+struct AnimationClip {
+    duration: f32,
+    channels: Vec<AnimationChannel>,
+}
+
+#[derive(Clone)]
+struct AnimationPlayer {
+    clips: Vec<AnimationClip>,
+    current_clip: Option<usize>,
+    time: f32,
+    speed: f32,
+    looping: bool,
+    playing: bool,
+    node_index_to_entity: HashMap<usize, Entity>,
+}
+
+impl Default for AnimationPlayer {
+    fn default() -> Self {
+        Self {
+            clips: Vec::new(),
+            current_clip: None,
+            time: 0.0,
+            speed: 1.0,
+            looping: true,
+            playing: true,
+            node_index_to_entity: HashMap::new(),
+        }
+    }
+}
+
+enum AnimationValue {
+    Vec3(Vec3),
+    Quat(Quat),
+}
+
+fn interpolate_vec3(start: &Vec3, end: &Vec3, factor: f32, interpolation: Interpolation) -> Vec3 {
+    match interpolation {
+        Interpolation::Step => *start,
+        Interpolation::Linear => start + (end - start) * factor,
+    }
+}
+
+fn interpolate_quat(start: &Quat, end: &Quat, factor: f32, interpolation: Interpolation) -> Quat {
+    let start_normalized = start.normalize();
+    match interpolation {
+        Interpolation::Step => start_normalized,
+        Interpolation::Linear => {
+            let end_normalized = end.normalize();
+            let aligned = if start_normalized.dot(&end_normalized) < 0.0 {
+                -end_normalized
+            } else {
+                end_normalized
+            };
+            nalgebra_glm::quat_slerp(&start_normalized, &aligned, factor).normalize()
+        }
+    }
+}
+
+fn sample_animation_channel(channel: &AnimationChannel, time: f32) -> Option<AnimationValue> {
+    let sampler = &channel.sampler;
+    let times = &sampler.input;
+    if times.is_empty() {
+        return None;
+    }
+    let last = times.len() - 1;
+    let (index_a, index_b, factor) = if time <= times[0] {
+        (0, 0, 0.0)
+    } else if time >= times[last] {
+        (last, last, 0.0)
+    } else {
+        let next = times.partition_point(|&keyframe_time| keyframe_time <= time);
+        let key = next - 1;
+        let span = times[next] - times[key];
+        let factor = if span > 0.0 {
+            (time - times[key]) / span
+        } else {
+            0.0
+        };
+        (key, next, factor)
+    };
+    match &sampler.output {
+        SamplerOutput::Vec3(values) => {
+            let start = values.get(index_a)?;
+            let end = values.get(index_b)?;
+            Some(AnimationValue::Vec3(interpolate_vec3(
+                start,
+                end,
+                factor,
+                sampler.interpolation,
+            )))
+        }
+        SamplerOutput::Quat(values) => {
+            let start = values.get(index_a)?;
+            let end = values.get(index_b)?;
+            Some(AnimationValue::Quat(interpolate_quat(
+                start,
+                end,
+                factor,
+                sampler.interpolation,
+            )))
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PerspectiveCamera {
     y_fov_radians: f32,
@@ -289,6 +436,9 @@ ecs!(
     EMISSIVE              => Emissive,            emissives;
     LIGHT                 => Light,               lights;
     MATERIAL              => Material,            materials;
+    SKIN                  => Skin,                skins;
+    SKINNED_MESH          => SkinnedMesh,         skinned_meshes;
+    ANIMATION_PLAYER      => AnimationPlayer,     animation_players;
 );
 
 type System = fn(&mut World);
@@ -662,6 +812,27 @@ fn get_render_mesh_mut(world: &mut World, entity: Entity) -> Option<&mut RenderM
     })
 }
 
+fn get_skinned_mesh_mut(world: &mut World, entity: Entity) -> Option<&mut SkinnedMesh> {
+    component_mut(world, entity, SKINNED_MESH, |table, row, tick| {
+        table.skinned_meshes[row].1 = tick;
+        &mut table.skinned_meshes[row].0
+    })
+}
+
+fn get_skin_mut(world: &mut World, entity: Entity) -> Option<&mut Skin> {
+    component_mut(world, entity, SKIN, |table, row, tick| {
+        table.skins[row].1 = tick;
+        &mut table.skins[row].0
+    })
+}
+
+fn get_animation_player_mut(world: &mut World, entity: Entity) -> Option<&mut AnimationPlayer> {
+    component_mut(world, entity, ANIMATION_PLAYER, |table, row, tick| {
+        table.animation_players[row].1 = tick;
+        &mut table.animation_players[row].0
+    })
+}
+
 fn get_light_mut(world: &mut World, entity: Entity) -> Option<&mut Light> {
     component_mut(world, entity, LIGHT, |table, row, tick| {
         table.lights[row].1 = tick;
@@ -786,6 +957,84 @@ fn update_global_transforms_system(world: &mut World) {
             }
         };
         set_global_transform(world, entity, GlobalTransform(global));
+    }
+}
+
+fn update_animation_players_system(world: &mut World) {
+    let delta_time = world.resources.delta_time;
+    for table in &mut world.tables {
+        if table.mask & ANIMATION_PLAYER == 0 {
+            continue;
+        }
+        for slot in table.animation_players.iter_mut() {
+            let player = &mut slot.0;
+            if !player.playing {
+                continue;
+            }
+            let Some(clip_index) = player.current_clip else {
+                continue;
+            };
+            let Some(clip) = player.clips.get(clip_index) else {
+                continue;
+            };
+            let duration = clip.duration;
+            player.time += delta_time * player.speed;
+            if player.time >= duration {
+                if player.looping {
+                    player.time = if duration > 0.0 {
+                        player.time % duration
+                    } else {
+                        0.0
+                    };
+                } else {
+                    player.time = duration;
+                    player.playing = false;
+                }
+            }
+        }
+    }
+}
+
+fn apply_animations_system(world: &mut World) {
+    let mut updates: Vec<(Entity, AnimationProperty, AnimationValue)> = Vec::new();
+    for table in &world.tables {
+        if table.mask & ANIMATION_PLAYER == 0 {
+            continue;
+        }
+        for slot in table.animation_players.iter() {
+            let player = &slot.0;
+            let Some(clip_index) = player.current_clip else {
+                continue;
+            };
+            let Some(clip) = player.clips.get(clip_index) else {
+                continue;
+            };
+            for channel in &clip.channels {
+                let Some(&entity) = player.node_index_to_entity.get(&channel.target_node) else {
+                    continue;
+                };
+                if let Some(value) = sample_animation_channel(channel, player.time) {
+                    updates.push((entity, channel.property, value));
+                }
+            }
+        }
+    }
+    for (entity, property, value) in updates {
+        if let Some(transform) = get_local_transform_mut(world, entity) {
+            match (property, value) {
+                (AnimationProperty::Translation, AnimationValue::Vec3(translation)) => {
+                    transform.translation = translation;
+                }
+                (AnimationProperty::Scale, AnimationValue::Vec3(scale)) => {
+                    transform.scale = scale;
+                }
+                (AnimationProperty::Rotation, AnimationValue::Quat(rotation)) => {
+                    transform.rotation = rotation.normalize();
+                }
+                _ => {}
+            }
+        }
+        mark_local_transform_dirty(world, entity);
     }
 }
 
@@ -1167,6 +1416,49 @@ fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3, Material)> {
     instances
 }
 
+fn skinned_instances(world: &World) -> Vec<(u32, Vec<Mat4>, Vec3, Material)> {
+    let required = SKINNED_MESH | SKIN | GLOBAL_TRANSFORM;
+    let mut instances = Vec::new();
+    for table in &world.tables {
+        if table.mask & required != required {
+            continue;
+        }
+        let emissive_table = table.mask & EMISSIVE != 0;
+        let material_table = table.mask & MATERIAL != 0;
+        for row in 0..table.entities.len() {
+            let handle = table.skinned_meshes[row].0.0;
+            let skin = &table.skins[row].0;
+            let matrices: Vec<Mat4> = skin
+                .joints
+                .iter()
+                .enumerate()
+                .map(|(index, &joint)| {
+                    let global = get_global_transform(world, joint)
+                        .map_or_else(Mat4::identity, |transform| transform.0);
+                    let inverse_bind = skin
+                        .inverse_bind
+                        .get(index)
+                        .copied()
+                        .unwrap_or_else(Mat4::identity);
+                    global * inverse_bind
+                })
+                .collect();
+            let emissive = if emissive_table {
+                table.emissives[row].0.0
+            } else {
+                Vec3::zeros()
+            };
+            let material = if material_table {
+                table.materials[row].0
+            } else {
+                Material::default()
+            };
+            instances.push((handle, matrices, emissive, material));
+        }
+    }
+    instances
+}
+
 fn gather_lights(world: &World) -> ([f32; 144], Vec<Mat4>) {
     let mut data = [0.0f32; 144];
     data[0] = 0.03;
@@ -1283,6 +1575,18 @@ impl State for Demo {
             "spin",
             spin_system,
         );
+        schedule_insert_before(
+            &mut world.resources.schedule,
+            "transforms",
+            "animate",
+            update_animation_players_system,
+        );
+        schedule_insert_before(
+            &mut world.resources.schedule,
+            "transforms",
+            "apply_animations",
+            apply_animations_system,
+        );
         schedule_insert_after(
             &mut world.resources.schedule,
             "spin",
@@ -1348,30 +1652,6 @@ impl State for Demo {
         }
         mark_local_transform_dirty(world, spot);
 
-        let count = 12;
-        for index in 0..count {
-            let angle = index as f32 / count as f32 * std::f32::consts::TAU;
-            world.resources.commands.push(SpawnCommand {
-                mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | MATERIAL,
-                transform: LocalTransform {
-                    translation: nalgebra_glm::vec3(angle.cos() * 3.0, 0.0, angle.sin() * 3.0),
-                    rotation: nalgebra_glm::quat_angle_axis(angle, &Vec3::y()),
-                    scale: nalgebra_glm::vec3(0.6, 0.6, 0.6),
-                },
-                render_mesh: 0,
-                emissive: Vec3::zeros(),
-                material: Material {
-                    albedo: nalgebra_glm::vec3(1.0, 1.0, 1.0),
-                    metallic: 0.85,
-                    roughness: 0.35,
-                    base_layer: 1,
-                    normal_layer: 1,
-                    orm_layer: 1,
-                    emissive_layer: 0,
-                },
-            });
-        }
-
         world.resources.commands.push(SpawnCommand {
             mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | EMISSIVE,
             transform: LocalTransform {
@@ -1379,7 +1659,7 @@ impl State for Demo {
                 scale: nalgebra_glm::vec3(0.4, 0.4, 0.4),
                 ..Default::default()
             },
-            render_mesh: 1,
+            render_mesh: 0,
             emissive: nalgebra_glm::vec3(4.0, 2.2, 0.8),
             material: Material::default(),
         });
@@ -1391,7 +1671,7 @@ impl State for Demo {
                 scale: nalgebra_glm::vec3(10.0, 0.1, 10.0),
                 ..Default::default()
             },
-            render_mesh: 1,
+            render_mesh: 0,
             emissive: Vec3::zeros(),
             material: Material {
                 albedo: nalgebra_glm::vec3(0.7, 0.7, 0.7),
@@ -1405,11 +1685,6 @@ impl State for Demo {
         });
     }
 }
-
-const TRIANGLE_VERTICES: [f32; 27] = [
-    1., -1., 0., 1., 0., 0., 0., 0., 1., -1., -1., 0., 0., 1., 0., 0., 0., 1., 0., 1., 0., 0., 0.,
-    1., 0., 0., 1.,
-];
 
 const CUBE_VERTICES: [f32; 324] = [
     1., -1., -1., 1., 1., 1., 1., 0., 0., 1., 1., -1., 1., 1., 1., 1., 0., 0., 1., 1., 1., 1., 1.,
@@ -1450,6 +1725,8 @@ const CUBEMAP_MIPGEN_SHADER: &str = include_str!("shaders/cubemap_mipgen.wgsl");
 const FILTER_ENVMAP_SHADER: &str = include_str!("shaders/filter_envmap.wgsl");
 
 const BRDF_LUT_SHADER: &str = include_str!("shaders/brdf_lut.wgsl");
+
+const SKIN_COMPUTE_SHADER: &str = include_str!("shaders/skin_compute.wgsl");
 
 const SHADER: &str = include_str!("shaders/mesh.wgsl");
 
@@ -1940,6 +2217,10 @@ struct GeometryPass {
     point_face_bind_groups: [wgpu::BindGroup; 6],
     point_cube_params_buffer: wgpu::Buffer,
     meshes: Vec<MeshGpu>,
+    skinned: Vec<SkinnedGpu>,
+    skin_pipeline: wgpu::ComputePipeline,
+    joint_buffer: wgpu::Buffer,
+    joint_capacity: u32,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -1973,10 +2254,17 @@ struct GltfNode {
     scale: Vec3,
     parent: Option<usize>,
     mesh: Option<usize>,
+    skin: Option<usize>,
+}
+
+struct GltfSkin {
+    joints: Vec<usize>,
+    inverse_bind: Vec<Mat4>,
 }
 
 struct GltfImport {
     primitives: Vec<Vec<f32>>,
+    skinned_primitives: Vec<Vec<u32>>,
     base_color: Option<Vec<u8>>,
     normal: Option<Vec<u8>>,
     orm: Option<Vec<u8>>,
@@ -1986,6 +2274,8 @@ struct GltfImport {
     roughness: f32,
     emissive_factor: Vec3,
     nodes: Vec<GltfNode>,
+    skins: Vec<GltfSkin>,
+    animations: Vec<AnimationClip>,
 }
 
 struct GltfScene {
@@ -1993,6 +2283,9 @@ struct GltfScene {
     material: Material,
     emissive: Vec3,
     mesh_base: u32,
+    skinned_mesh_base: u32,
+    skins: Vec<GltfSkin>,
+    animations: Vec<AnimationClip>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2019,7 +2312,8 @@ fn decode_texture(buffers: &[gltf::buffer::Data], texture: Option<gltf::Image>) 
 #[cfg(not(target_arch = "wasm32"))]
 fn fetch_gltf(url: &str) -> Option<GltfImport> {
     use std::io::Read;
-    let cache = std::env::temp_dir().join("engine_codegolfed_gltf.glb");
+    let name = url.rsplit('/').next().unwrap_or("model.glb");
+    let cache = std::env::temp_dir().join(format!("engine_codegolfed_{name}"));
     let bytes = match std::fs::read(&cache) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -2035,11 +2329,12 @@ fn fetch_gltf(url: &str) -> Option<GltfImport> {
         }
     };
     let (document, buffers, _images) = gltf::import_slice(&bytes).ok()?;
-    let mut primitives = Vec::new();
+    let mut primitives: Vec<Vec<f32>> = Vec::new();
+    let mut skinned_primitives: Vec<Vec<u32>> = Vec::new();
     let mut mesh_first = std::collections::HashMap::new();
+    let mut skinned_mesh_first = std::collections::HashMap::new();
     let mut material = None;
     for mesh in document.meshes() {
-        mesh_first.insert(mesh.index(), primitives.len());
         for primitive in mesh.primitives() {
             let reader =
                 primitive.reader(|buffer| buffers.get(buffer.index()).map(|data| &data.0[..]));
@@ -2059,19 +2354,65 @@ fn fetch_gltf(url: &str) -> Option<GltfImport> {
                 .read_indices()
                 .map(|iter| iter.into_u32().collect())
                 .unwrap_or_else(|| (0..positions.len() as u32).collect());
-            let mut vertices = Vec::with_capacity(indices.len() * 11);
-            for &index in &indices {
-                let p = positions[index as usize];
-                let n = normals
-                    .get(index as usize)
-                    .copied()
-                    .unwrap_or([0.0, 1.0, 0.0]);
-                let uv = uvs.get(index as usize).copied().unwrap_or([0.0, 0.0]);
-                vertices.extend_from_slice(&[
-                    p[0], p[1], p[2], 1.0, 1.0, 1.0, n[0], n[1], n[2], uv[0], uv[1],
-                ]);
+            let joints = reader
+                .read_joints(0)
+                .map(|iter| iter.into_u16().collect::<Vec<[u16; 4]>>());
+            let weights = reader
+                .read_weights(0)
+                .map(|iter| iter.into_f32().collect::<Vec<[f32; 4]>>());
+            if let (Some(joints), Some(weights)) = (joints, weights) {
+                skinned_mesh_first
+                    .entry(mesh.index())
+                    .or_insert(skinned_primitives.len());
+                let mut vertices = Vec::with_capacity(indices.len() * 16);
+                for &index in &indices {
+                    let p = positions[index as usize];
+                    let n = normals
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or([0.0, 1.0, 0.0]);
+                    let uv = uvs.get(index as usize).copied().unwrap_or([0.0, 0.0]);
+                    let j = joints.get(index as usize).copied().unwrap_or([0, 0, 0, 0]);
+                    let w = weights
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or([1.0, 0.0, 0.0, 0.0]);
+                    vertices.extend_from_slice(&[
+                        p[0].to_bits(),
+                        p[1].to_bits(),
+                        p[2].to_bits(),
+                        n[0].to_bits(),
+                        n[1].to_bits(),
+                        n[2].to_bits(),
+                        uv[0].to_bits(),
+                        uv[1].to_bits(),
+                        w[0].to_bits(),
+                        w[1].to_bits(),
+                        w[2].to_bits(),
+                        w[3].to_bits(),
+                        j[0] as u32,
+                        j[1] as u32,
+                        j[2] as u32,
+                        j[3] as u32,
+                    ]);
+                }
+                skinned_primitives.push(vertices);
+            } else {
+                mesh_first.entry(mesh.index()).or_insert(primitives.len());
+                let mut vertices = Vec::with_capacity(indices.len() * 11);
+                for &index in &indices {
+                    let p = positions[index as usize];
+                    let n = normals
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or([0.0, 1.0, 0.0]);
+                    let uv = uvs.get(index as usize).copied().unwrap_or([0.0, 0.0]);
+                    vertices.extend_from_slice(&[
+                        p[0], p[1], p[2], 1.0, 1.0, 1.0, n[0], n[1], n[2], uv[0], uv[1],
+                    ]);
+                }
+                primitives.push(vertices);
             }
-            primitives.push(vertices);
             if material.is_none() {
                 material = Some(primitive.material());
             }
@@ -2127,20 +2468,128 @@ fn fetch_gltf(url: &str) -> Option<GltfImport> {
         .nodes()
         .map(|node| {
             let (translation, rotation, scale) = node.transform().decomposed();
+            let mesh = node.mesh().and_then(|m| {
+                if node.skin().is_some() {
+                    skinned_mesh_first.get(&m.index()).copied()
+                } else {
+                    mesh_first.get(&m.index()).copied()
+                }
+            });
             GltfNode {
                 translation: nalgebra_glm::vec3(translation[0], translation[1], translation[2]),
                 rotation: Quat::new(rotation[3], rotation[0], rotation[1], rotation[2]),
                 scale: nalgebra_glm::vec3(scale[0], scale[1], scale[2]),
                 parent: parents[node.index()],
-                mesh: node
-                    .mesh()
-                    .and_then(|m| mesh_first.get(&m.index()).copied()),
+                mesh,
+                skin: node.skin().map(|skin| skin.index()),
             }
+        })
+        .collect();
+
+    let skins = document
+        .skins()
+        .map(|skin| {
+            let reader = skin.reader(|buffer| buffers.get(buffer.index()).map(|data| &data.0[..]));
+            let inverse_bind = reader
+                .read_inverse_bind_matrices()
+                .map(|iter| {
+                    iter.map(|matrix| {
+                        Mat4::from_column_slice(&[
+                            matrix[0][0],
+                            matrix[0][1],
+                            matrix[0][2],
+                            matrix[0][3],
+                            matrix[1][0],
+                            matrix[1][1],
+                            matrix[1][2],
+                            matrix[1][3],
+                            matrix[2][0],
+                            matrix[2][1],
+                            matrix[2][2],
+                            matrix[2][3],
+                            matrix[3][0],
+                            matrix[3][1],
+                            matrix[3][2],
+                            matrix[3][3],
+                        ])
+                    })
+                    .collect()
+                })
+                .unwrap_or_default();
+            GltfSkin {
+                joints: skin.joints().map(|joint| joint.index()).collect(),
+                inverse_bind,
+            }
+        })
+        .collect();
+
+    let animations = document
+        .animations()
+        .map(|animation| {
+            let mut channels = Vec::new();
+            let mut duration = 0.0f32;
+            for channel in animation.channels() {
+                let target_node = channel.target().node().index();
+                let reader =
+                    channel.reader(|buffer| buffers.get(buffer.index()).map(|data| &data.0[..]));
+                let Some(input) = reader.read_inputs().map(|iter| iter.collect::<Vec<f32>>())
+                else {
+                    continue;
+                };
+                if let Some(&last) = input.last() {
+                    duration = duration.max(last);
+                }
+                let keyframe_count = input.len();
+                let Some(outputs) = reader.read_outputs() else {
+                    continue;
+                };
+                let (property, output) = match outputs {
+                    gltf::animation::util::ReadOutputs::Translations(iter) => (
+                        AnimationProperty::Translation,
+                        SamplerOutput::Vec3(
+                            iter.map(|value| nalgebra_glm::vec3(value[0], value[1], value[2]))
+                                .collect(),
+                        ),
+                    ),
+                    gltf::animation::util::ReadOutputs::Scales(iter) => (
+                        AnimationProperty::Scale,
+                        SamplerOutput::Vec3(
+                            iter.map(|value| nalgebra_glm::vec3(value[0], value[1], value[2]))
+                                .collect(),
+                        ),
+                    ),
+                    gltf::animation::util::ReadOutputs::Rotations(iter) => (
+                        AnimationProperty::Rotation,
+                        SamplerOutput::Quat(
+                            iter.into_f32()
+                                .map(|value| Quat::new(value[3], value[0], value[1], value[2]))
+                                .collect(),
+                        ),
+                    ),
+                    _ => continue,
+                };
+                let output = collapse_cubic_output(output, keyframe_count);
+                let interpolation = match channel.sampler().interpolation() {
+                    gltf::animation::Interpolation::Step => Interpolation::Step,
+                    _ => Interpolation::Linear,
+                };
+                channels.push(AnimationChannel {
+                    target_node,
+                    property,
+                    sampler: AnimationSampler {
+                        input,
+                        output,
+                        interpolation,
+                    },
+                });
+            }
+            AnimationClip { duration, channels }
         })
         .collect();
 
     Some(GltfImport {
         primitives,
+        skinned_primitives,
         base_color,
         normal,
         orm,
@@ -2154,11 +2603,33 @@ fn fetch_gltf(url: &str) -> Option<GltfImport> {
             emissive_factor[2],
         ),
         nodes,
+        skins,
+        animations,
     })
 }
 
+fn collapse_cubic_output(output: SamplerOutput, keyframe_count: usize) -> SamplerOutput {
+    match output {
+        SamplerOutput::Vec3(values) if values.len() == keyframe_count * 3 => SamplerOutput::Vec3(
+            (0..keyframe_count)
+                .map(|index| values[index * 3 + 1])
+                .collect(),
+        ),
+        SamplerOutput::Quat(values) if values.len() == keyframe_count * 3 => SamplerOutput::Quat(
+            (0..keyframe_count)
+                .map(|index| values[index * 3 + 1])
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn spawn_gltf(world: &mut World, scene: &GltfScene, placement: LocalTransform) {
-    let root = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM);
+    let mut root_mask = LOCAL_TRANSFORM | GLOBAL_TRANSFORM;
+    if !scene.animations.is_empty() {
+        root_mask |= ANIMATION_PLAYER;
+    }
+    let root = spawn(world, root_mask);
     if let Some(transform) = get_local_transform_mut(world, root) {
         *transform = placement;
     }
@@ -2167,7 +2638,12 @@ fn spawn_gltf(world: &mut World, scene: &GltfScene, placement: LocalTransform) {
     for node in &scene.nodes {
         let mut mask = LOCAL_TRANSFORM | GLOBAL_TRANSFORM | PARENT;
         if node.mesh.is_some() {
-            mask |= RENDER_MESH | MATERIAL | EMISSIVE;
+            mask |= MATERIAL | EMISSIVE;
+            if node.skin.is_some() {
+                mask |= SKINNED_MESH | SKIN;
+            } else {
+                mask |= RENDER_MESH;
+            }
         }
         let entity = spawn(world, mask);
         if let Some(transform) = get_local_transform_mut(world, entity) {
@@ -2176,7 +2652,11 @@ fn spawn_gltf(world: &mut World, scene: &GltfScene, placement: LocalTransform) {
             transform.scale = node.scale;
         }
         if let Some(mesh) = node.mesh {
-            if let Some(render_mesh) = get_render_mesh_mut(world, entity) {
+            if node.skin.is_some() {
+                if let Some(skinned_mesh) = get_skinned_mesh_mut(world, entity) {
+                    skinned_mesh.0 = scene.skinned_mesh_base + mesh as u32;
+                }
+            } else if let Some(render_mesh) = get_render_mesh_mut(world, entity) {
                 render_mesh.0 = scene.mesh_base + mesh as u32;
             }
             if let Some(material) = get_material_mut(world, entity) {
@@ -2197,6 +2677,33 @@ fn spawn_gltf(world: &mut World, scene: &GltfScene, placement: LocalTransform) {
             parent.0 = Some(parent_entity);
         }
         mark_local_transform_dirty(world, entities[index]);
+    }
+    for (index, node) in scene.nodes.iter().enumerate() {
+        if let Some(skin_index) = node.skin
+            && let Some(skin) = scene.skins.get(skin_index)
+        {
+            let joints: Vec<Entity> = skin
+                .joints
+                .iter()
+                .map(|&joint_node| entities[joint_node])
+                .collect();
+            if let Some(skin_component) = get_skin_mut(world, entities[index]) {
+                skin_component.joints = joints;
+                skin_component.inverse_bind = skin.inverse_bind.clone();
+            }
+        }
+    }
+    if !scene.animations.is_empty() {
+        let node_map: HashMap<usize, Entity> = entities
+            .iter()
+            .enumerate()
+            .map(|(index, &entity)| (index, entity))
+            .collect();
+        if let Some(player) = get_animation_player_mut(world, root) {
+            player.clips = scene.animations.clone();
+            player.current_clip = Some(0);
+            player.node_index_to_entity = node_map;
+        }
     }
 }
 
@@ -2294,6 +2801,49 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
     MeshGpu {
         vertex_buffer,
         vertex_count: vertices.len() as u32 / 11,
+        instance_buffer,
+        instance_capacity: 1,
+    }
+}
+
+struct SkinnedGpu {
+    rest_buffer: wgpu::Buffer,
+    output_buffer: wgpu::Buffer,
+    params_buffer: wgpu::Buffer,
+    vertex_count: u32,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: u32,
+}
+
+fn skinned_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[u32]) -> SkinnedGpu {
+    let vertex_count = vertices.len() as u32 / 16;
+    let rest_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: std::mem::size_of_val(vertices).max(16) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&rest_buffer, 0, bytemuck::cast_slice(vertices));
+    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (vertex_count as u64 * 44).max(44),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let params_buffer = uniform_buffer(device, 16);
+    let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 112,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    SkinnedGpu {
+        rest_buffer,
+        output_buffer,
+        params_buffer,
+        vertex_count,
         instance_buffer,
         instance_capacity: 1,
     }
@@ -2619,6 +3169,82 @@ impl PassNode for GeometryPass {
             }
         }
 
+        let skinned = skinned_instances(context.world);
+        let mut joint_data: Vec<f32> = Vec::new();
+        let mut skinned_draws: Vec<(usize, u32)> = Vec::new();
+        for (handle, matrices, emissive, material) in &skinned {
+            let handle = *handle as usize;
+            if handle >= self.skinned.len() {
+                continue;
+            }
+            let joint_offset = (joint_data.len() / 16) as u32;
+            for matrix in matrices {
+                joint_data.extend_from_slice(matrix.as_slice());
+            }
+            let vertex_count = self.skinned[handle].vertex_count;
+            context.queue.write_buffer(
+                &self.skinned[handle].params_buffer,
+                0,
+                bytemuck::cast_slice(&[vertex_count, joint_offset, 0, 0]),
+            );
+            let mut instance: Vec<f32> = Vec::with_capacity(28);
+            instance.extend_from_slice(Mat4::identity().as_slice());
+            instance.extend_from_slice(&[emissive.x, emissive.y, emissive.z, material.roughness]);
+            instance.extend_from_slice(&[
+                material.albedo.x,
+                material.albedo.y,
+                material.albedo.z,
+                material.metallic,
+            ]);
+            instance.push(material.base_layer as f32);
+            instance.push(material.normal_layer as f32);
+            instance.push(material.orm_layer as f32);
+            instance.push(material.emissive_layer as f32);
+            let target = &mut self.skinned[handle];
+            upload_instances(
+                context.device,
+                context.queue,
+                &mut target.instance_buffer,
+                &mut target.instance_capacity,
+                &instance,
+                1,
+            );
+            skinned_draws.push((handle, vertex_count));
+        }
+        if !joint_data.is_empty() {
+            let needed = joint_data.len() as u32;
+            if needed > self.joint_capacity {
+                self.joint_capacity = needed.next_power_of_two();
+                self.joint_buffer = storage_buffer(context.device, self.joint_capacity as u64 * 4);
+            }
+            context
+                .queue
+                .write_buffer(&self.joint_buffer, 0, bytemuck::cast_slice(&joint_data));
+            for &(handle, vertex_count) in &skinned_draws {
+                let skinned = &self.skinned[handle];
+                let bind = bind_group(
+                    context.device,
+                    &self.skin_pipeline.get_bind_group_layout(0),
+                    vec![
+                        (0, skinned.rest_buffer.as_entire_binding()),
+                        (1, self.joint_buffer.as_entire_binding()),
+                        (2, skinned.output_buffer.as_entire_binding()),
+                        (3, skinned.params_buffer.as_entire_binding()),
+                    ],
+                );
+                let mut compute =
+                    context
+                        .encoder
+                        .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: None,
+                            timestamp_writes: None,
+                        });
+                compute.set_pipeline(&self.skin_pipeline);
+                compute.set_bind_group(0, &bind, &[]);
+                compute.dispatch_workgroups(vertex_count.div_ceil(64), 1, 1);
+            }
+        }
+
         let (color_view, color_load, color_store) = color_attachment(context, "color");
         let (normal_view, normal_load, normal_store) = color_attachment(context, "normals");
         let (depth_view, depth_load, depth_store) = depth_attachment(context, "depth");
@@ -2666,6 +3292,12 @@ impl PassNode for GeometryPass {
                 pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
                 pass.draw(0..mesh.vertex_count, 0..counts[handle]);
             }
+        }
+        for &(handle, vertex_count) in &skinned_draws {
+            let skinned = &self.skinned[handle];
+            pass.set_vertex_buffer(0, skinned.output_buffer.slice(..));
+            pass.set_vertex_buffer(1, skinned.instance_buffer.slice(..));
+            pass.draw(0..vertex_count, 0..1);
         }
     }
 }
@@ -2773,6 +3405,7 @@ struct Graphics {
     graph: RenderGraph,
     size: (u32, u32),
     gltf: Option<GltfScene>,
+    gltf_skinned: Option<GltfScene>,
 }
 
 pub struct App {
@@ -2912,7 +3545,7 @@ fn render_pipeline(
 }
 
 const TEXTURE_SIZE: usize = 512;
-const TEXTURE_LAYERS: usize = 5;
+const TEXTURE_LAYERS: usize = 6;
 const TEXTURE_CELL: usize = TEXTURE_SIZE / 8;
 
 fn albedo_pixel(layer: usize, x: usize, y: usize) -> [u8; 4] {
@@ -3364,13 +3997,19 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let helmet = fetch_gltf(
         "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb",
     );
-    let mut meshes = vec![
-        mesh_gpu(&device, &queue, &with_uv(&TRIANGLE_VERTICES)),
-        mesh_gpu(&device, &queue, &with_uv(&CUBE_VERTICES)),
-    ];
+    let character = fetch_gltf(
+        "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/CesiumMan/glTF-Binary/CesiumMan.glb",
+    );
+    let mut meshes = vec![mesh_gpu(&device, &queue, &with_uv(&CUBE_VERTICES))];
     if let Some(ref import) = helmet {
         for primitive in &import.primitives {
             meshes.push(mesh_gpu(&device, &queue, primitive));
+        }
+    }
+    let mut skinned = Vec::new();
+    if let Some(ref import) = character {
+        for primitive in &import.skinned_primitives {
+            skinned.push(skinned_gpu(&device, &queue, primitive));
         }
     }
 
@@ -3408,8 +4047,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         &device,
         &queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
-        |layer, x, y| match (&helmet, layer) {
-            (Some(mesh), 4) => helmet_layer(&mesh.base_color, x, y, [255, 255, 255, 255]),
+        |layer, x, y| match (&helmet, &character, layer) {
+            (Some(mesh), _, 4) => helmet_layer(&mesh.base_color, x, y, [255, 255, 255, 255]),
+            (_, Some(mesh), 5) => helmet_layer(&mesh.base_color, x, y, [255, 255, 255, 255]),
             _ => albedo_pixel(layer, x, y),
         },
     );
@@ -3417,8 +4057,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         &device,
         &queue,
         wgpu::TextureFormat::Rgba8Unorm,
-        |layer, x, y| match (&helmet, layer) {
-            (Some(mesh), 4) => helmet_layer(&mesh.normal, x, y, [128, 128, 255, 255]),
+        |layer, x, y| match (&helmet, &character, layer) {
+            (Some(mesh), _, 4) => helmet_layer(&mesh.normal, x, y, [128, 128, 255, 255]),
+            (_, Some(mesh), 5) => helmet_layer(&mesh.normal, x, y, [128, 128, 255, 255]),
             _ => normal_pixel(layer, x, y),
         },
     );
@@ -3426,8 +4067,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         &device,
         &queue,
         wgpu::TextureFormat::Rgba8Unorm,
-        |layer, x, y| match (&helmet, layer) {
-            (Some(mesh), 4) => helmet_layer(&mesh.orm, x, y, [255, 255, 255, 255]),
+        |layer, x, y| match (&helmet, &character, layer) {
+            (Some(mesh), _, 4) => helmet_layer(&mesh.orm, x, y, [255, 255, 255, 255]),
+            (_, Some(mesh), 5) => helmet_layer(&mesh.orm, x, y, [255, 255, 255, 255]),
             _ => orm_pixel(layer, x, y),
         },
     );
@@ -3435,8 +4077,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         &device,
         &queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
-        |layer, x, y| match (&helmet, layer) {
-            (Some(mesh), 4) => helmet_layer(&mesh.emissive, x, y, [0, 0, 0, 255]),
+        |layer, x, y| match (&helmet, &character, layer) {
+            (Some(mesh), _, 4) => helmet_layer(&mesh.emissive, x, y, [0, 0, 0, 255]),
+            (_, Some(mesh), 5) => helmet_layer(&mesh.emissive, x, y, [0, 0, 0, 255]),
             _ => emissive_pixel(layer, x, y),
         },
     );
@@ -3452,7 +4095,27 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             emissive_layer: 4,
         },
         emissive: import.emissive_factor,
+        mesh_base: 1,
+        skinned_mesh_base: 0,
+        skins: import.skins,
+        animations: import.animations,
+    });
+    let character_scene = character.map(|import| GltfScene {
+        nodes: import.nodes,
+        material: Material {
+            albedo: import.base_factor,
+            metallic: import.metallic,
+            roughness: import.roughness,
+            base_layer: 5,
+            normal_layer: 5,
+            orm_layer: 5,
+            emissive_layer: 5,
+        },
+        emissive: import.emissive_factor,
         mesh_base: 2,
+        skinned_mesh_base: 0,
+        skins: import.skins,
+        animations: import.animations,
     });
     let equirect_view = equirect_texture(
         &device,
@@ -3652,6 +4315,8 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let bright = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let blur_temp = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let bloom = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
+    let skin_pipeline = compute_pipeline(&device, SKIN_COMPUTE_SHADER);
+    let joint_buffer = storage_buffer(&device, 64);
     add_pass(
         &mut graph,
         Box::new(GeometryPass {
@@ -3680,6 +4345,10 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             point_face_bind_groups,
             point_cube_params_buffer,
             meshes,
+            skinned,
+            skin_pipeline,
+            joint_buffer,
+            joint_capacity: 0,
             camera_buffer,
             lights_buffer,
             bind_group: geometry_bind_group,
@@ -3801,6 +4470,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         graph,
         size: (width, height),
         gltf: gltf_scene,
+        gltf_skinned: character_scene,
     }
 }
 
@@ -3991,6 +4661,21 @@ impl ApplicationHandler for App {
                     },
                 );
             }
+            if let Some(scene) = self
+                .graphics
+                .as_ref()
+                .and_then(|graphics| graphics.gltf_skinned.as_ref())
+            {
+                spawn_gltf(
+                    &mut self.world,
+                    scene,
+                    LocalTransform {
+                        translation: nalgebra_glm::vec3(2.5, 0.0, 0.0),
+                        scale: nalgebra_glm::vec3(1.0, 1.0, 1.0),
+                        ..Default::default()
+                    },
+                );
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -4024,6 +4709,21 @@ impl ApplicationHandler for App {
                     scene,
                     LocalTransform {
                         translation: nalgebra_glm::vec3(0.0, 1.0, 0.0),
+                        scale: nalgebra_glm::vec3(1.0, 1.0, 1.0),
+                        ..Default::default()
+                    },
+                );
+            }
+            if let Some(scene) = self
+                .graphics
+                .as_ref()
+                .and_then(|graphics| graphics.gltf_skinned.as_ref())
+            {
+                spawn_gltf(
+                    &mut self.world,
+                    scene,
+                    LocalTransform {
+                        translation: nalgebra_glm::vec3(2.5, 0.0, 0.0),
                         scale: nalgebra_glm::vec3(1.0, 1.0, 1.0),
                         ..Default::default()
                     },
