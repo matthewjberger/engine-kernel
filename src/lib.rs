@@ -1454,6 +1454,35 @@ const SKY_SHADER: &str = include_str!("shaders/sky.wgsl");
 
 const SHADOW_SHADER: &str = include_str!("shaders/shadow.wgsl");
 
+const POINT_SHADOW_SHADER: &str = include_str!("shaders/point_shadow.wgsl");
+
+const CUBE_FACES: [(Vec3, Vec3); 6] = [
+    (
+        nalgebra_glm::Vec3::new(1.0, 0.0, 0.0),
+        nalgebra_glm::Vec3::new(0.0, -1.0, 0.0),
+    ),
+    (
+        nalgebra_glm::Vec3::new(-1.0, 0.0, 0.0),
+        nalgebra_glm::Vec3::new(0.0, -1.0, 0.0),
+    ),
+    (
+        nalgebra_glm::Vec3::new(0.0, 1.0, 0.0),
+        nalgebra_glm::Vec3::new(0.0, 0.0, 1.0),
+    ),
+    (
+        nalgebra_glm::Vec3::new(0.0, -1.0, 0.0),
+        nalgebra_glm::Vec3::new(0.0, 0.0, -1.0),
+    ),
+    (
+        nalgebra_glm::Vec3::new(0.0, 0.0, 1.0),
+        nalgebra_glm::Vec3::new(0.0, -1.0, 0.0),
+    ),
+    (
+        nalgebra_glm::Vec3::new(0.0, 0.0, -1.0),
+        nalgebra_glm::Vec3::new(0.0, -1.0, 0.0),
+    ),
+];
+
 const FULLSCREEN_VERTEX: &str = include_str!("shaders/fullscreen.wgsl");
 
 const BRIGHT_SHADER: &str = include_str!("shaders/bright.wgsl");
@@ -1901,6 +1930,12 @@ struct GeometryPass {
     cluster_assign_bind_group: wgpu::BindGroup,
     sky_pipeline: wgpu::RenderPipeline,
     sky_bind_group: wgpu::BindGroup,
+    point_pipeline: wgpu::RenderPipeline,
+    point_face_views: [wgpu::TextureView; 6],
+    point_depth_view: wgpu::TextureView,
+    point_face_buffers: [wgpu::Buffer; 6],
+    point_face_bind_groups: [wgpu::BindGroup; 6],
+    point_cube_params_buffer: wgpu::Buffer,
     meshes: Vec<MeshGpu>,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
@@ -2191,6 +2226,85 @@ impl PassNode for GeometryPass {
             spot_shadows.len(),
             &counts,
         );
+
+        let point_count = lights[12] as usize;
+        let mut point_index = -1i32;
+        let mut point_position = Vec3::zeros();
+        let mut point_range = 1.0f32;
+        for index in 0..point_count {
+            if lights[80 + index * 4 + 3] < -1.5 {
+                point_index = index as i32;
+                point_position = nalgebra_glm::vec3(
+                    lights[16 + index * 4],
+                    lights[16 + index * 4 + 1],
+                    lights[16 + index * 4 + 2],
+                );
+                point_range = lights[16 + index * 4 + 3].max(0.5);
+                break;
+            }
+        }
+        context.queue.write_buffer(
+            &self.point_cube_params_buffer,
+            0,
+            bytemuck::cast_slice(&[point_index as f32, 0.02, 0.0, 0.0]),
+        );
+        if point_index >= 0 {
+            let y_flip = Mat4::new(
+                1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            );
+            let projection =
+                y_flip * reverse_z_perspective(std::f32::consts::FRAC_PI_2, 1.0, 0.05, point_range);
+            for (face, (direction, up)) in CUBE_FACES.iter().enumerate() {
+                let target = point_position + direction;
+                let view_projection =
+                    projection * nalgebra_glm::look_at(&point_position, &target, up);
+                let mut face_data = [0.0f32; 20];
+                face_data[..16].copy_from_slice(view_projection.as_slice());
+                face_data[16..19].copy_from_slice(point_position.as_slice());
+                face_data[19] = point_range;
+                context.queue.write_buffer(
+                    &self.point_face_buffers[face],
+                    0,
+                    bytemuck::cast_slice(&face_data),
+                );
+            }
+            for (face, face_view) in self.point_face_views.iter().enumerate() {
+                let mut point_pass =
+                    context
+                        .encoder
+                        .begin_render_pass(&wgpu::RenderPassDescriptor {
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: face_view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: Some(
+                                wgpu::RenderPassDepthStencilAttachment {
+                                    view: &self.point_depth_view,
+                                    depth_ops: Some(wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(0.0),
+                                        store: wgpu::StoreOp::Store,
+                                    }),
+                                    stencil_ops: None,
+                                },
+                            ),
+                            ..Default::default()
+                        });
+                point_pass.set_pipeline(&self.point_pipeline);
+                point_pass.set_bind_group(0, &self.point_face_bind_groups[face], &[]);
+                for (handle, mesh) in self.meshes.iter().enumerate() {
+                    if counts[handle] > 0 {
+                        point_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        point_pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
+                        point_pass.draw(0..mesh.vertex_count, 0..counts[handle]);
+                    }
+                }
+            }
+        }
 
         let (color_view, color_load, color_store) = color_attachment(context, "color");
         let (normal_view, normal_load, normal_store) = color_attachment(context, "normals");
@@ -2881,6 +2995,70 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         emissive_pixel,
     );
     let (irradiance_view, prefiltered_view, brdf_view, ibl_sampler) = generate_ibl(&device, &queue);
+    let point_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(POINT_SHADOW_SHADER.into()),
+    });
+    let point_pipeline = render_pipeline(
+        &device,
+        &point_shader,
+        &mesh_buffers,
+        &[Some(wgpu::TextureFormat::R16Float.into())],
+        true,
+        wgpu::CompareFunction::GreaterEqual,
+    );
+    let point_cube_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 512,
+            height: 512,
+            depth_or_array_layers: 6,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let point_cube_view = point_cube_texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::Cube),
+        ..Default::default()
+    });
+    let point_face_views: [wgpu::TextureView; 6] = std::array::from_fn(|face| {
+        point_cube_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_array_layer: face as u32,
+            array_layer_count: Some(1),
+            ..Default::default()
+        })
+    });
+    let point_depth_view = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 512,
+                height: 512,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&Default::default());
+    let point_cube_params_buffer = uniform_buffer(&device, 16);
+    let point_face_buffers: [wgpu::Buffer; 6] =
+        std::array::from_fn(|_| uniform_buffer(&device, 80));
+    let point_face_bind_groups: [wgpu::BindGroup; 6] = std::array::from_fn(|face| {
+        bind_group(
+            &device,
+            &point_pipeline.get_bind_group_layout(0),
+            vec![(0, point_face_buffers[face].as_entire_binding())],
+        )
+    });
     let geometry_bind_group = bind_group(
         &device,
         &pipeline.get_bind_group_layout(0),
@@ -2904,6 +3082,8 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             (16, wgpu::BindingResource::TextureView(&normal_array_view)),
             (17, wgpu::BindingResource::TextureView(&orm_array_view)),
             (18, wgpu::BindingResource::TextureView(&emissive_array_view)),
+            (19, wgpu::BindingResource::TextureView(&point_cube_view)),
+            (20, point_cube_params_buffer.as_entire_binding()),
         ],
     );
     let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3027,6 +3207,12 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             cluster_assign_bind_group,
             sky_pipeline,
             sky_bind_group,
+            point_pipeline,
+            point_face_views,
+            point_depth_view,
+            point_face_buffers,
+            point_face_bind_groups,
+            point_cube_params_buffer,
             meshes,
             camera_buffer,
             lights_buffer,

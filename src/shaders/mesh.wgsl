@@ -59,6 +59,18 @@ struct LightGrid {
 @group(0) @binding(16) var normal_textures: texture_2d_array<f32>;
 @group(0) @binding(17) var orm_textures: texture_2d_array<f32>;
 @group(0) @binding(18) var emissive_textures: texture_2d_array<f32>;
+@group(0) @binding(19) var point_cube: texture_cube<f32>;
+@group(0) @binding(20) var<uniform> point_cube_params: vec4<f32>;
+
+fn point_shadow_factor(index: u32, world_position: vec3<f32>) -> f32 {
+    if i32(index) != i32(point_cube_params.x) {
+        return 1.0;
+    }
+    let to_fragment = world_position - lights.point_position[index].xyz;
+    let distance = length(to_fragment) / lights.point_position[index].w;
+    let sampled = textureSampleLevel(point_cube, ibl_sampler, normalize(to_fragment), 0.0).r;
+    return select(0.0, 1.0, distance - point_cube_params.y <= sampled);
+}
 
 fn cotangent_frame(normal: vec3<f32>, position: vec3<f32>, uv: vec2<f32>) -> mat3x3<f32> {
     let dp1 = dpdx(position);
@@ -347,7 +359,9 @@ fn lighting(
             lights.point_color[index].w,
         );
         let spot_visibility = spot_shadow_factor(world_position, i32(lights.point_shadow[index].x));
-        let radiance = lights.point_color[index].rgb * attenuation * spot * spot_visibility;
+        let point_visibility = point_shadow_factor(index, world_position);
+        let radiance =
+            lights.point_color[index].rgb * attenuation * spot * spot_visibility * point_visibility;
         color += brdf(normal, view, to_light / distance, radiance, albedo, metallic, roughness, f0);
     }
     return color;
