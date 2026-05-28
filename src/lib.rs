@@ -2239,186 +2239,83 @@ impl PassNode for GeometryPass {
     }
 }
 
-struct BrightPass {
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+enum Binding {
+    Read(&'static str),
+    Sampler,
+    Uniform,
 }
 
-impl PassNode for BrightPass {
+struct FullscreenPass {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    output: &'static str,
+    bindings: Vec<Binding>,
+    sampler: Option<wgpu::Sampler>,
+    uniform: Option<wgpu::Buffer>,
+    update: Option<fn(&PassContext, &wgpu::Buffer)>,
+}
+
+fn ssao_update(context: &PassContext, buffer: &wgpu::Buffer) {
+    let projection =
+        camera_projection(context.world, context.aspect_ratio).unwrap_or_else(Mat4::identity);
+    let inverse_projection = projection.try_inverse().unwrap_or_else(Mat4::identity);
+    let mut data = [0.0f32; 20];
+    data[..16].copy_from_slice(inverse_projection.as_slice());
+    data[16..].copy_from_slice(&[24.0, 0.025, 2.5, 0.0]);
+    context
+        .queue
+        .write_buffer(buffer, 0, bytemuck::cast_slice(&data));
+}
+
+fn composite_update(context: &PassContext, buffer: &wgpu::Buffer) {
+    let bloom: f32 = if context.world.resources.bloom_enabled {
+        0.8
+    } else {
+        0.0
+    };
+    context
+        .queue
+        .write_buffer(buffer, 0, bytemuck::cast_slice(&[bloom, 0.0, 0.0, 0.0]));
+}
+
+impl PassNode for FullscreenPass {
     fn reads(&self) -> Vec<&'static str> {
-        vec!["scene"]
+        self.bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                Binding::Read(name) => Some(*name),
+                _ => None,
+            })
+            .collect()
     }
 
     fn color_writes(&self) -> Vec<&'static str> {
-        vec!["bright"]
+        vec![self.output]
     }
 
     fn execute(&mut self, context: &mut PassContext) {
-        let scene_view = read_view(context, "scene");
-        let bind_group = bind_group(
-            context.device,
-            &self.bind_group_layout,
-            vec![
-                (0, wgpu::BindingResource::TextureView(scene_view)),
-                (1, wgpu::BindingResource::Sampler(&self.sampler)),
-            ],
-        );
-
-        fullscreen_pass(context, &self.pipeline, &bind_group, "bright");
-    }
-}
-
-struct BlurPass {
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-    axis_buffer: wgpu::Buffer,
-}
-
-impl PassNode for BlurPass {
-    fn reads(&self) -> Vec<&'static str> {
-        vec!["input"]
-    }
-
-    fn color_writes(&self) -> Vec<&'static str> {
-        vec!["output"]
-    }
-
-    fn execute(&mut self, context: &mut PassContext) {
-        let input_view = read_view(context, "input");
-        let bind_group = bind_group(
-            context.device,
-            &self.bind_group_layout,
-            vec![
-                (0, wgpu::BindingResource::TextureView(input_view)),
-                (1, wgpu::BindingResource::Sampler(&self.sampler)),
-                (2, self.axis_buffer.as_entire_binding()),
-            ],
-        );
-
-        fullscreen_pass(context, &self.pipeline, &bind_group, "output");
-    }
-}
-
-struct SsaoPass {
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    data_buffer: wgpu::Buffer,
-}
-
-impl PassNode for SsaoPass {
-    fn reads(&self) -> Vec<&'static str> {
-        vec!["depth", "normals"]
-    }
-
-    fn color_writes(&self) -> Vec<&'static str> {
-        vec!["ao_raw"]
-    }
-
-    fn execute(&mut self, context: &mut PassContext) {
-        let projection =
-            camera_projection(context.world, context.aspect_ratio).unwrap_or_else(Mat4::identity);
-        let inverse_projection = projection.try_inverse().unwrap_or_else(Mat4::identity);
-        let mut data = [0.0f32; 20];
-        data[..16].copy_from_slice(inverse_projection.as_slice());
-        data[16..].copy_from_slice(&[24.0, 0.025, 2.5, 0.0]);
-        context
-            .queue
-            .write_buffer(&self.data_buffer, 0, bytemuck::cast_slice(&data));
-
-        let depth_view = read_view(context, "depth");
-        let normal_view = read_view(context, "normals");
-        let bind_group = bind_group(
-            context.device,
-            &self.bind_group_layout,
-            vec![
-                (0, wgpu::BindingResource::TextureView(depth_view)),
-                (1, wgpu::BindingResource::TextureView(normal_view)),
-                (2, self.data_buffer.as_entire_binding()),
-            ],
-        );
-
-        fullscreen_pass(context, &self.pipeline, &bind_group, "ao_raw");
-    }
-}
-
-struct SsaoBlurPass {
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-}
-
-impl PassNode for SsaoBlurPass {
-    fn reads(&self) -> Vec<&'static str> {
-        vec!["ao_raw", "depth", "normals"]
-    }
-
-    fn color_writes(&self) -> Vec<&'static str> {
-        vec!["ao"]
-    }
-
-    fn execute(&mut self, context: &mut PassContext) {
-        let ao_view = read_view(context, "ao_raw");
-        let depth_view = read_view(context, "depth");
-        let normal_view = read_view(context, "normals");
-        let bind_group = bind_group(
-            context.device,
-            &self.bind_group_layout,
-            vec![
-                (0, wgpu::BindingResource::TextureView(ao_view)),
-                (1, wgpu::BindingResource::TextureView(depth_view)),
-                (2, wgpu::BindingResource::TextureView(normal_view)),
-            ],
-        );
-
-        fullscreen_pass(context, &self.pipeline, &bind_group, "ao");
-    }
-}
-
-struct CompositePass {
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-    params_buffer: wgpu::Buffer,
-}
-
-impl PassNode for CompositePass {
-    fn reads(&self) -> Vec<&'static str> {
-        vec!["scene", "bloom", "ao"]
-    }
-
-    fn color_writes(&self) -> Vec<&'static str> {
-        vec!["color"]
-    }
-
-    fn execute(&mut self, context: &mut PassContext) {
-        let bloom: f32 = if context.world.resources.bloom_enabled {
-            0.8
-        } else {
-            0.0
-        };
-        context.queue.write_buffer(
-            &self.params_buffer,
-            0,
-            bytemuck::cast_slice(&[bloom, 0.0, 0.0, 0.0]),
-        );
-
-        let scene_view = read_view(context, "scene");
-        let bloom_view = read_view(context, "bloom");
-        let ao_view = read_view(context, "ao");
-        let bind_group = bind_group(
-            context.device,
-            &self.bind_group_layout,
-            vec![
-                (0, wgpu::BindingResource::TextureView(scene_view)),
-                (1, wgpu::BindingResource::Sampler(&self.sampler)),
-                (2, wgpu::BindingResource::TextureView(bloom_view)),
-                (3, wgpu::BindingResource::TextureView(ao_view)),
-                (4, self.params_buffer.as_entire_binding()),
-            ],
-        );
-
-        fullscreen_pass(context, &self.pipeline, &bind_group, "color");
+        if let (Some(update), Some(uniform)) = (self.update, &self.uniform) {
+            update(context, uniform);
+        }
+        let entries: Vec<(u32, wgpu::BindingResource)> = self
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| {
+                let resource = match binding {
+                    Binding::Read(name) => {
+                        wgpu::BindingResource::TextureView(read_view(context, name))
+                    }
+                    Binding::Sampler => {
+                        wgpu::BindingResource::Sampler(self.sampler.as_ref().unwrap())
+                    }
+                    Binding::Uniform => self.uniform.as_ref().unwrap().as_entire_binding(),
+                };
+                (index as u32, resource)
+            })
+            .collect();
+        let bind_group = bind_group(context.device, &self.bind_group_layout, entries);
+        fullscreen_pass(context, &self.pipeline, &bind_group, self.output);
     }
 }
 
@@ -2618,6 +2515,25 @@ fn albedo_texture_array(
         ..Default::default()
     });
     (view, sampler)
+}
+
+fn shadow_atlas_view(device: &wgpu::Device) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 2048,
+                height: 2048,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
 }
 
 fn ibl_storage_texture(device: &wgpu::Device, size: u32, layers: u32, mips: u32) -> wgpu::Texture {
@@ -2883,36 +2799,8 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         multiview_mask: None,
         cache: None,
     });
-    let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size: wgpu::Extent3d {
-            width: 2048,
-            height: 2048,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let shadow_view = shadow_texture.create_view(&Default::default());
-    let spot_atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size: wgpu::Extent3d {
-            width: 2048,
-            height: 2048,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let spot_atlas_view = spot_atlas_texture.create_view(&Default::default());
+    let shadow_view = shadow_atlas_view(&device);
+    let spot_atlas_view = shadow_atlas_view(&device);
     let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
@@ -3121,18 +3009,35 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     );
     add_pass(
         &mut graph,
-        Box::new(SsaoPass {
+        Box::new(FullscreenPass {
             pipeline: ssao_pipeline,
             bind_group_layout: ssao_bind_group_layout,
-            data_buffer: ssao_data_buffer,
+            output: "ao_raw",
+            bindings: vec![
+                Binding::Read("depth"),
+                Binding::Read("normals"),
+                Binding::Uniform,
+            ],
+            sampler: None,
+            uniform: Some(ssao_data_buffer),
+            update: Some(ssao_update),
         }),
         &[("depth", depth), ("normals", normals), ("ao_raw", ao_raw)],
     );
     add_pass(
         &mut graph,
-        Box::new(SsaoBlurPass {
+        Box::new(FullscreenPass {
             pipeline: ssao_blur_pipeline,
             bind_group_layout: ssao_blur_bind_group_layout,
+            output: "ao",
+            bindings: vec![
+                Binding::Read("ao_raw"),
+                Binding::Read("depth"),
+                Binding::Read("normals"),
+            ],
+            sampler: None,
+            uniform: None,
+            update: None,
         }),
         &[
             ("ao_raw", ao_raw),
@@ -3143,40 +3048,59 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     );
     add_pass(
         &mut graph,
-        Box::new(BrightPass {
+        Box::new(FullscreenPass {
             pipeline: bright_pipeline,
             bind_group_layout: bright_bind_group_layout,
-            sampler: linear_sampler(&device),
+            output: "bright",
+            bindings: vec![Binding::Read("scene"), Binding::Sampler],
+            sampler: Some(linear_sampler(&device)),
+            uniform: None,
+            update: None,
         }),
         &[("scene", scene), ("bright", bright)],
     );
     add_pass(
         &mut graph,
-        Box::new(BlurPass {
+        Box::new(FullscreenPass {
             pipeline: blur_horizontal_pipeline,
             bind_group_layout: blur_horizontal_bind_group_layout,
-            sampler: linear_sampler(&device),
-            axis_buffer: axis_buffer(&device, &queue, [1.0, 0.0, 0.0, 0.0]),
+            output: "output",
+            bindings: vec![Binding::Read("input"), Binding::Sampler, Binding::Uniform],
+            sampler: Some(linear_sampler(&device)),
+            uniform: Some(axis_buffer(&device, &queue, [1.0, 0.0, 0.0, 0.0])),
+            update: None,
         }),
         &[("input", bright), ("output", blur_temp)],
     );
     add_pass(
         &mut graph,
-        Box::new(BlurPass {
+        Box::new(FullscreenPass {
             pipeline: blur_vertical_pipeline,
             bind_group_layout: blur_vertical_bind_group_layout,
-            sampler: linear_sampler(&device),
-            axis_buffer: axis_buffer(&device, &queue, [0.0, 1.0, 0.0, 0.0]),
+            output: "output",
+            bindings: vec![Binding::Read("input"), Binding::Sampler, Binding::Uniform],
+            sampler: Some(linear_sampler(&device)),
+            uniform: Some(axis_buffer(&device, &queue, [0.0, 1.0, 0.0, 0.0])),
+            update: None,
         }),
         &[("input", blur_temp), ("output", bloom)],
     );
     add_pass(
         &mut graph,
-        Box::new(CompositePass {
+        Box::new(FullscreenPass {
             pipeline: composite_pipeline,
             bind_group_layout: composite_bind_group_layout,
-            sampler: linear_sampler(&device),
-            params_buffer: composite_params_buffer,
+            output: "color",
+            bindings: vec![
+                Binding::Read("scene"),
+                Binding::Sampler,
+                Binding::Read("bloom"),
+                Binding::Read("ao"),
+                Binding::Uniform,
+            ],
+            sampler: Some(linear_sampler(&device)),
+            uniform: Some(composite_params_buffer),
+            update: Some(composite_update),
         }),
         &[
             ("scene", scene),
