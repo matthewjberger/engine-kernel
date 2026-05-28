@@ -80,12 +80,22 @@ struct RenderMesh(u32);
 #[derive(Clone, Copy, Default)]
 struct Emissive(Vec3);
 
+#[derive(Clone, Copy, Default, PartialEq)]
+enum LightKind {
+    #[default]
+    Directional,
+    Point,
+    Spot,
+}
+
 #[derive(Clone, Copy, Default)]
 struct Light {
     color: Vec3,
     intensity: f32,
-    point: bool,
+    kind: LightKind,
     range: f32,
+    inner_cone: f32,
+    outer_cone: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -1126,8 +1136,8 @@ fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3, Material)> {
     instances
 }
 
-fn gather_lights(world: &World) -> [f32; 80] {
-    let mut data = [0.0f32; 80];
+fn gather_lights(world: &World) -> [f32; 112] {
+    let mut data = [0.0f32; 112];
     data[0] = 0.03;
     data[1] = 0.03;
     data[2] = 0.04;
@@ -1140,8 +1150,18 @@ fn gather_lights(world: &World) -> [f32; 80] {
             let global = table.global_transforms[row].0.0;
             let light = table.lights[row].0;
             let color = light.color * light.intensity;
-            if light.point {
-                if point_count < 8 {
+            match light.kind {
+                LightKind::Directional => {
+                    let direction = -transform_forward(&global);
+                    data[4] = direction.x;
+                    data[5] = direction.y;
+                    data[6] = direction.z;
+                    data[7] = 1.0;
+                    data[8] = color.x;
+                    data[9] = color.y;
+                    data[10] = color.z;
+                }
+                LightKind::Point | LightKind::Spot if point_count < 8 => {
                     let position = transform_translation(&global);
                     let slot = 16 + point_count * 4;
                     data[slot] = position.x;
@@ -1152,17 +1172,21 @@ fn gather_lights(world: &World) -> [f32; 80] {
                     data[color_slot] = color.x;
                     data[color_slot + 1] = color.y;
                     data[color_slot + 2] = color.z;
+                    let direction_slot = 80 + point_count * 4;
+                    if light.kind == LightKind::Spot {
+                        let direction = transform_forward(&global);
+                        data[direction_slot] = direction.x;
+                        data[direction_slot + 1] = direction.y;
+                        data[direction_slot + 2] = direction.z;
+                        data[direction_slot + 3] = light.outer_cone.cos();
+                        data[color_slot + 3] = light.inner_cone.cos();
+                    } else {
+                        data[direction_slot + 3] = -2.0;
+                        data[color_slot + 3] = -2.0;
+                    }
                     point_count += 1;
                 }
-            } else {
-                let direction = -transform_forward(&global);
-                data[4] = direction.x;
-                data[5] = direction.y;
-                data[6] = direction.z;
-                data[7] = 1.0;
-                data[8] = color.x;
-                data[9] = color.y;
-                data[10] = color.z;
+                _ => {}
             }
         }
     }
@@ -1252,10 +1276,26 @@ impl State for Demo {
         if let Some(light) = get_light_mut(world, lamp) {
             light.color = nalgebra_glm::vec3(1.0, 0.55, 0.2);
             light.intensity = 4.0;
-            light.point = true;
+            light.kind = LightKind::Point;
             light.range = 7.0;
         }
         mark_local_transform_dirty(world, lamp);
+
+        let spot = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | LIGHT);
+        if let Some(local) = get_local_transform_mut(world, spot) {
+            local.translation = nalgebra_glm::vec3(0.0, 6.0, 0.0);
+            local.rotation =
+                nalgebra_glm::quat_angle_axis(-std::f32::consts::FRAC_PI_2, &Vec3::x());
+        }
+        if let Some(light) = get_light_mut(world, spot) {
+            light.color = nalgebra_glm::vec3(0.4, 0.7, 1.0);
+            light.intensity = 60.0;
+            light.kind = LightKind::Spot;
+            light.range = 16.0;
+            light.inner_cone = 0.2;
+            light.outer_cone = 0.35;
+        }
+        mark_local_transform_dirty(world, spot);
 
         let count = 12;
         for index in 0..count {
@@ -1344,6 +1384,7 @@ struct Lights {
     point_count: vec4<f32>,
     point_position: array<vec4<f32>, 8>,
     point_color: array<vec4<f32>, 8>,
+    point_direction: array<vec4<f32>, 8>,
 }
 struct Shadow {
     cascade_view_projection: array<mat4x4<f32>, 4>,
@@ -1503,6 +1544,13 @@ fn range_attenuation(range: f32, distance: f32) -> f32 {
     let clamped = max(distance, 0.01);
     return max(min(1.0 - pow(distance / range, 4.0), 1.0), 0.0) / (clamped * clamped);
 }
+fn spot_attenuation(spot_direction: vec3<f32>, to_light: vec3<f32>, outer_cos: f32, inner_cos: f32) -> f32 {
+    let actual = dot(normalize(spot_direction), normalize(-to_light));
+    if actual > outer_cos {
+        return select(smoothstep(outer_cos, inner_cos, actual), 1.0, actual >= inner_cos);
+    }
+    return 0.0;
+}
 fn brdf(
     normal: vec3<f32>,
     view: vec3<f32>,
@@ -1543,7 +1591,13 @@ fn lighting(
         let to_light = lights.point_position[index].xyz - world_position;
         let distance = max(length(to_light), 0.0001);
         let attenuation = range_attenuation(lights.point_position[index].w, distance);
-        let radiance = lights.point_color[index].rgb * attenuation;
+        let spot = spot_attenuation(
+            lights.point_direction[index].xyz,
+            to_light,
+            lights.point_direction[index].w,
+            lights.point_color[index].w,
+        );
+        let radiance = lights.point_color[index].rgb * attenuation * spot;
         color += brdf(normal, view, to_light / distance, radiance, albedo, metallic, roughness, f0);
     }
     return color;
@@ -2830,7 +2884,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     ];
 
     let camera_buffer = uniform_buffer(&device, 144);
-    let lights_buffer = uniform_buffer(&device, 320);
+    let lights_buffer = uniform_buffer(&device, 448);
     let shadow_buffer = uniform_buffer(&device, 368);
     let geometry_bind_group = bind_group(
         &device,
