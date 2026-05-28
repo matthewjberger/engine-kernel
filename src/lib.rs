@@ -1387,26 +1387,6 @@ impl State for Demo {
         world.resources.commands.push(SpawnCommand {
             mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | MATERIAL,
             transform: LocalTransform {
-                translation: nalgebra_glm::vec3(0.0, 0.6, 0.0),
-                scale: nalgebra_glm::vec3(1.2, 1.2, 1.2),
-                ..Default::default()
-            },
-            render_mesh: 2,
-            emissive: Vec3::zeros(),
-            material: Material {
-                albedo: nalgebra_glm::vec3(0.72, 0.72, 0.74),
-                metallic: 0.1,
-                roughness: 0.5,
-                base_layer: 0,
-                normal_layer: 0,
-                orm_layer: 0,
-                emissive_layer: 0,
-            },
-        });
-
-        world.resources.commands.push(SpawnCommand {
-            mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | MATERIAL,
-            transform: LocalTransform {
                 translation: nalgebra_glm::vec3(0.0, -1.0, 0.0),
                 scale: nalgebra_glm::vec3(10.0, 0.1, 10.0),
                 ..Default::default()
@@ -1985,13 +1965,57 @@ fn upload_instances(
     }
 }
 
+struct GltfNode {
+    translation: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+    parent: Option<usize>,
+    mesh: Option<usize>,
+}
+
+struct GltfImport {
+    primitives: Vec<Vec<f32>>,
+    base_color: Option<Vec<u8>>,
+    normal: Option<Vec<u8>>,
+    orm: Option<Vec<u8>>,
+    emissive: Option<Vec<u8>>,
+    base_factor: Vec3,
+    metallic: f32,
+    roughness: f32,
+    emissive_factor: Vec3,
+    nodes: Vec<GltfNode>,
+}
+
+struct GltfScene {
+    nodes: Vec<GltfNode>,
+    material: Material,
+    emissive: Vec3,
+    mesh_base: u32,
+}
+
 #[cfg(target_arch = "wasm32")]
-fn fetch_gltf(_url: &str) -> Option<Vec<f32>> {
+fn fetch_gltf(_url: &str) -> Option<GltfImport> {
     None
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn fetch_gltf(url: &str) -> Option<Vec<f32>> {
+fn decode_texture(buffers: &[gltf::buffer::Data], texture: Option<gltf::Image>) -> Option<Vec<u8>> {
+    let bytes = match texture?.source() {
+        gltf::image::Source::View { view, .. } => {
+            let buffer = &buffers[view.buffer().index()].0;
+            buffer[view.offset()..view.offset() + view.length()].to_vec()
+        }
+        gltf::image::Source::Uri { .. } => return None,
+    };
+    let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    Some(
+        image::imageops::resize(&decoded, 512, 512, image::imageops::FilterType::Triangle)
+            .into_raw(),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fetch_gltf(url: &str) -> Option<GltfImport> {
     use std::io::Read;
     let cache = std::env::temp_dir().join("engine_codegolfed_gltf.glb");
     let bytes = match std::fs::read(&cache) {
@@ -2009,8 +2033,11 @@ fn fetch_gltf(url: &str) -> Option<Vec<f32>> {
         }
     };
     let (document, buffers, _images) = gltf::import_slice(&bytes).ok()?;
-    let mut vertices = Vec::new();
+    let mut primitives = Vec::new();
+    let mut mesh_first = std::collections::HashMap::new();
+    let mut material = None;
     for mesh in document.meshes() {
+        mesh_first.insert(mesh.index(), primitives.len());
         for primitive in mesh.primitives() {
             let reader =
                 primitive.reader(|buffer| buffers.get(buffer.index()).map(|data| &data.0[..]));
@@ -2022,31 +2049,162 @@ fn fetch_gltf(url: &str) -> Option<Vec<f32>> {
                 .read_normals()
                 .map(|iter| iter.collect())
                 .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
+            let uvs: Vec<[f32; 2]> = reader
+                .read_tex_coords(0)
+                .map(|iter| iter.into_f32().collect())
+                .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
             let indices: Vec<u32> = reader
                 .read_indices()
                 .map(|iter| iter.into_u32().collect())
                 .unwrap_or_else(|| (0..positions.len() as u32).collect());
+            let mut vertices = Vec::with_capacity(indices.len() * 11);
             for &index in &indices {
-                let position = positions[index as usize];
-                let normal = normals
+                let p = positions[index as usize];
+                let n = normals
                     .get(index as usize)
                     .copied()
                     .unwrap_or([0.0, 1.0, 0.0]);
+                let uv = uvs.get(index as usize).copied().unwrap_or([0.0, 0.0]);
                 vertices.extend_from_slice(&[
-                    position[0],
-                    position[1],
-                    position[2],
-                    1.0,
-                    1.0,
-                    1.0,
-                    normal[0],
-                    normal[1],
-                    normal[2],
+                    p[0], p[1], p[2], 1.0, 1.0, 1.0, n[0], n[1], n[2], uv[0], uv[1],
                 ]);
+            }
+            primitives.push(vertices);
+            if material.is_none() {
+                material = Some(primitive.material());
             }
         }
     }
-    (!vertices.is_empty()).then_some(vertices)
+    let material = material?;
+    let pbr = material.pbr_metallic_roughness();
+    let base_color = decode_texture(
+        &buffers,
+        pbr.base_color_texture().map(|i| i.texture().source()),
+    );
+    let normal = decode_texture(
+        &buffers,
+        material.normal_texture().map(|t| t.texture().source()),
+    );
+    let emissive = decode_texture(
+        &buffers,
+        material.emissive_texture().map(|i| i.texture().source()),
+    );
+    let metallic_roughness = decode_texture(
+        &buffers,
+        pbr.metallic_roughness_texture()
+            .map(|i| i.texture().source()),
+    );
+    let occlusion = decode_texture(
+        &buffers,
+        material.occlusion_texture().map(|t| t.texture().source()),
+    );
+    let orm = (metallic_roughness.is_some() || occlusion.is_some()).then(|| {
+        (0..512 * 512usize)
+            .flat_map(|texel| {
+                let r = occlusion.as_ref().map_or(255, |o| o[texel * 4]);
+                let g = metallic_roughness
+                    .as_ref()
+                    .map_or(255, |m| m[texel * 4 + 1]);
+                let b = metallic_roughness
+                    .as_ref()
+                    .map_or(255, |m| m[texel * 4 + 2]);
+                [r, g, b, 255]
+            })
+            .collect()
+    });
+    let base_factor = pbr.base_color_factor();
+    let emissive_factor = material.emissive_factor();
+
+    let mut parents = vec![None; document.nodes().count()];
+    for node in document.nodes() {
+        for child in node.children() {
+            parents[child.index()] = Some(node.index());
+        }
+    }
+    let nodes = document
+        .nodes()
+        .map(|node| {
+            let (translation, rotation, scale) = node.transform().decomposed();
+            GltfNode {
+                translation: nalgebra_glm::vec3(translation[0], translation[1], translation[2]),
+                rotation: Quat::new(rotation[3], rotation[0], rotation[1], rotation[2]),
+                scale: nalgebra_glm::vec3(scale[0], scale[1], scale[2]),
+                parent: parents[node.index()],
+                mesh: node
+                    .mesh()
+                    .and_then(|m| mesh_first.get(&m.index()).copied()),
+            }
+        })
+        .collect();
+
+    Some(GltfImport {
+        primitives,
+        base_color,
+        normal,
+        orm,
+        emissive,
+        base_factor: nalgebra_glm::vec3(base_factor[0], base_factor[1], base_factor[2]),
+        metallic: pbr.metallic_factor(),
+        roughness: pbr.roughness_factor(),
+        emissive_factor: nalgebra_glm::vec3(
+            emissive_factor[0],
+            emissive_factor[1],
+            emissive_factor[2],
+        ),
+        nodes,
+    })
+}
+
+fn spawn_gltf(world: &mut World, scene: &GltfScene, placement: LocalTransform) {
+    let root = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM);
+    if let Some(transform) = get_local_transform_mut(world, root) {
+        *transform = placement;
+    }
+    mark_local_transform_dirty(world, root);
+    let mut entities = Vec::with_capacity(scene.nodes.len());
+    for node in &scene.nodes {
+        let mut mask = LOCAL_TRANSFORM | GLOBAL_TRANSFORM | PARENT;
+        if node.mesh.is_some() {
+            mask |= RENDER_MESH | MATERIAL | EMISSIVE;
+        }
+        let entity = spawn(world, mask);
+        if let Some(transform) = get_local_transform_mut(world, entity) {
+            transform.translation = node.translation;
+            transform.rotation = node.rotation;
+            transform.scale = node.scale;
+        }
+        if let Some(mesh) = node.mesh {
+            if let Some(render_mesh) = get_render_mesh_mut(world, entity) {
+                render_mesh.0 = scene.mesh_base + mesh as u32;
+            }
+            if let Some(material) = get_material_mut(world, entity) {
+                *material = scene.material;
+            }
+            if let Some(emissive) = get_emissive_mut(world, entity) {
+                emissive.0 = scene.emissive;
+            }
+        }
+        entities.push(entity);
+    }
+    for (index, node) in scene.nodes.iter().enumerate() {
+        let parent_entity = node.parent.map_or(root, |parent| entities[parent]);
+        if let Some(parent) = component_mut(world, entities[index], PARENT, |table, row, tick| {
+            table.parents[row].1 = tick;
+            &mut table.parents[row].0
+        }) {
+            parent.0 = Some(parent_entity);
+        }
+        mark_local_transform_dirty(world, entities[index]);
+    }
+}
+
+fn with_uv(vertices: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(vertices.len() / 9 * 11);
+    for vertex in vertices.chunks_exact(9) {
+        out.extend_from_slice(vertex);
+        out.extend_from_slice(&[0.0, 0.0]);
+    }
+    out
 }
 
 fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> MeshGpu {
@@ -2065,7 +2223,7 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
     });
     MeshGpu {
         vertex_buffer,
-        vertex_count: vertices.len() as u32 / 9,
+        vertex_count: vertices.len() as u32 / 11,
         instance_buffer,
         instance_capacity: 1,
     }
@@ -2544,6 +2702,7 @@ struct Graphics {
     egui_state: egui_winit::State,
     graph: RenderGraph,
     size: (u32, u32),
+    gltf: Option<GltfScene>,
 }
 
 pub struct App {
@@ -2682,8 +2841,12 @@ fn render_pipeline(
     })
 }
 
+const TEXTURE_SIZE: usize = 512;
+const TEXTURE_LAYERS: usize = 5;
+const TEXTURE_CELL: usize = TEXTURE_SIZE / 8;
+
 fn albedo_pixel(layer: usize, x: usize, y: usize) -> [u8; 4] {
-    let checker = ((x / 8) + (y / 8)).is_multiple_of(2);
+    let checker = ((x / TEXTURE_CELL) + (y / TEXTURE_CELL)).is_multiple_of(2);
     let (r, g, b) = match layer {
         1 if checker => (230, 120, 40),
         1 => (60, 30, 15),
@@ -2703,15 +2866,15 @@ fn normal_pixel(layer: usize, x: usize, y: usize) -> [u8; 4] {
         3 => 0.9,
         _ => 0.0,
     };
-    let cell_u = ((x % 8) as f32 / 8.0 * 2.0 - 1.0) * strength;
-    let cell_v = ((y % 8) as f32 / 8.0 * 2.0 - 1.0) * strength;
+    let cell_u = ((x % TEXTURE_CELL) as f32 / TEXTURE_CELL as f32 * 2.0 - 1.0) * strength;
+    let cell_v = ((y % TEXTURE_CELL) as f32 / TEXTURE_CELL as f32 * 2.0 - 1.0) * strength;
     let length = (cell_u * cell_u + cell_v * cell_v + 1.0).sqrt();
     let encode = |value: f32| ((value / length * 0.5 + 0.5) * 255.0) as u8;
     [encode(cell_u), encode(cell_v), encode(1.0), 255]
 }
 
 fn orm_pixel(layer: usize, x: usize, y: usize) -> [u8; 4] {
-    let checker = ((x / 8) + (y / 8)).is_multiple_of(2);
+    let checker = ((x / TEXTURE_CELL) + (y / TEXTURE_CELL)).is_multiple_of(2);
     let roughness = match layer {
         1 if checker => 255,
         1 => 70,
@@ -2730,8 +2893,8 @@ fn texture_array(
     format: wgpu::TextureFormat,
     fill: impl Fn(usize, usize, usize) -> [u8; 4],
 ) -> wgpu::TextureView {
-    let size = 64usize;
-    let layers = 4usize;
+    let size = TEXTURE_SIZE;
+    let layers = TEXTURE_LAYERS;
     let mut pixels = vec![0u8; size * size * layers * 4];
     for layer in 0..layers {
         for y in 0..size {
@@ -2979,13 +3142,14 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         label: None,
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
     });
-    let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 7 => Float32x3];
+    let vertex_attrs =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 7 => Float32x3, 13 => Float32x2];
     let instance_attrs = wgpu::vertex_attr_array![
         2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 8 => Float32x4, 9 => Float32x4
     ];
     let mesh_buffers = [
         wgpu::VertexBufferLayout {
-            array_stride: 36,
+            array_stride: 44,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &vertex_attrs,
         },
@@ -3036,14 +3200,17 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let composite_bind_group_layout = composite_pipeline.get_bind_group_layout(0);
     let composite_params_buffer = uniform_buffer(&device, 16);
 
-    let mut meshes = vec![
-        mesh_gpu(&device, &queue, &TRIANGLE_VERTICES),
-        mesh_gpu(&device, &queue, &CUBE_VERTICES),
-    ];
-    if let Some(helmet) = fetch_gltf(
+    let helmet = fetch_gltf(
         "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb",
-    ) {
-        meshes.push(mesh_gpu(&device, &queue, &helmet));
+    );
+    let mut meshes = vec![
+        mesh_gpu(&device, &queue, &with_uv(&TRIANGLE_VERTICES)),
+        mesh_gpu(&device, &queue, &with_uv(&CUBE_VERTICES)),
+    ];
+    if let Some(ref import) = helmet {
+        for primitive in &import.primitives {
+            meshes.push(mesh_gpu(&device, &queue, primitive));
+        }
     }
 
     let camera_buffer = uniform_buffer(&device, 208);
@@ -3065,25 +3232,67 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
+    let helmet_layer = |source: &Option<Vec<u8>>, x: usize, y: usize, default: [u8; 4]| {
+        source.as_ref().map_or(default, |pixels| {
+            let index = (y * TEXTURE_SIZE + x) * 4;
+            [
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            ]
+        })
+    };
     let albedo_array_view = texture_array(
         &device,
         &queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
-        albedo_pixel,
+        |layer, x, y| match (&helmet, layer) {
+            (Some(mesh), 4) => helmet_layer(&mesh.base_color, x, y, [255, 255, 255, 255]),
+            _ => albedo_pixel(layer, x, y),
+        },
     );
     let normal_array_view = texture_array(
         &device,
         &queue,
         wgpu::TextureFormat::Rgba8Unorm,
-        normal_pixel,
+        |layer, x, y| match (&helmet, layer) {
+            (Some(mesh), 4) => helmet_layer(&mesh.normal, x, y, [128, 128, 255, 255]),
+            _ => normal_pixel(layer, x, y),
+        },
     );
-    let orm_array_view = texture_array(&device, &queue, wgpu::TextureFormat::Rgba8Unorm, orm_pixel);
+    let orm_array_view = texture_array(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        |layer, x, y| match (&helmet, layer) {
+            (Some(mesh), 4) => helmet_layer(&mesh.orm, x, y, [255, 255, 255, 255]),
+            _ => orm_pixel(layer, x, y),
+        },
+    );
     let emissive_array_view = texture_array(
         &device,
         &queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
-        emissive_pixel,
+        |layer, x, y| match (&helmet, layer) {
+            (Some(mesh), 4) => helmet_layer(&mesh.emissive, x, y, [0, 0, 0, 255]),
+            _ => emissive_pixel(layer, x, y),
+        },
     );
+    let gltf_scene = helmet.map(|import| GltfScene {
+        nodes: import.nodes,
+        material: Material {
+            albedo: import.base_factor,
+            metallic: import.metallic,
+            roughness: import.roughness,
+            base_layer: 4,
+            normal_layer: 4,
+            orm_layer: 4,
+            emissive_layer: 4,
+        },
+        emissive: import.emissive_factor,
+        mesh_base: 2,
+    });
     let (irradiance_view, prefiltered_view, brdf_view, ibl_sampler) = generate_ibl(&device, &queue);
     let point_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
@@ -3424,6 +3633,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         egui_state,
         graph,
         size: (width, height),
+        gltf: gltf_scene,
     }
 }
 
@@ -3599,6 +3809,21 @@ impl ApplicationHandler for App {
             )));
             self.world = new_world();
             self.state.initialize(&mut self.world);
+            if let Some(scene) = self
+                .graphics
+                .as_ref()
+                .and_then(|graphics| graphics.gltf.as_ref())
+            {
+                spawn_gltf(
+                    &mut self.world,
+                    scene,
+                    LocalTransform {
+                        translation: nalgebra_glm::vec3(0.0, 1.0, 0.0),
+                        scale: nalgebra_glm::vec3(1.0, 1.0, 1.0),
+                        ..Default::default()
+                    },
+                );
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -3622,6 +3847,21 @@ impl ApplicationHandler for App {
             self.pending = None;
             self.world = new_world();
             self.state.initialize(&mut self.world);
+            if let Some(scene) = self
+                .graphics
+                .as_ref()
+                .and_then(|graphics| graphics.gltf.as_ref())
+            {
+                spawn_gltf(
+                    &mut self.world,
+                    scene,
+                    LocalTransform {
+                        translation: nalgebra_glm::vec3(0.0, 1.0, 0.0),
+                        scale: nalgebra_glm::vec3(1.0, 1.0, 1.0),
+                        ..Default::default()
+                    },
+                );
+            }
         }
 
         let Some(graphics) = self.graphics.as_mut() else {

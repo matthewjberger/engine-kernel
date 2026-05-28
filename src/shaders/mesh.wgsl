@@ -255,6 +255,7 @@ struct VertexInput {
     @location(6) emissive: vec4<f32>,
     @location(8) albedo_metallic: vec4<f32>,
     @location(9) layers: vec4<f32>,
+    @location(13) uv: vec2<f32>,
 }
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -383,7 +384,7 @@ fn lighting(
         in.albedo_metallic.rgb,
         vec2<f32>(in.albedo_metallic.w, in.emissive.w),
         u32(in.layers.x),
-        planar_uv(in.position * model_scale, in.normal),
+        select(planar_uv(in.position * model_scale, in.normal), in.uv, in.layers.x >= 4.0),
         u32(in.layers.y),
         u32(in.layers.z),
         u32(in.layers.w),
