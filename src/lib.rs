@@ -1775,6 +1775,10 @@ const SSAO_BLUR_SHADER: &str = include_str!("shaders/ssao_blur.wgsl");
 
 const COMPOSITE_SHADER: &str = include_str!("shaders/composite.wgsl");
 
+const FXAA_SHADER: &str = include_str!("shaders/fxaa.wgsl");
+
+const AUTO_EXPOSURE_SHADER: &str = include_str!("shaders/auto_exposure.wgsl");
+
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -3306,6 +3310,7 @@ enum Binding {
     Read(&'static str),
     Sampler,
     Uniform,
+    Storage,
 }
 
 struct FullscreenPass {
@@ -3315,6 +3320,7 @@ struct FullscreenPass {
     bindings: Vec<Binding>,
     sampler: Option<wgpu::Sampler>,
     uniform: Option<wgpu::Buffer>,
+    storage: Option<wgpu::Buffer>,
     update: Option<fn(&PassContext, &wgpu::Buffer)>,
 }
 
@@ -3339,6 +3345,20 @@ fn composite_update(context: &PassContext, buffer: &wgpu::Buffer) {
     context
         .queue
         .write_buffer(buffer, 0, bytemuck::cast_slice(&[bloom, 0.0, 0.0, 0.0]));
+}
+
+fn fxaa_update(context: &PassContext, buffer: &wgpu::Buffer) {
+    let (width, height) = context.size;
+    context.queue.write_buffer(
+        buffer,
+        0,
+        bytemuck::cast_slice(&[
+            1.0 / width.max(1) as f32,
+            1.0 / height.max(1) as f32,
+            1.0,
+            0.75,
+        ]),
+    );
 }
 
 impl PassNode for FullscreenPass {
@@ -3373,12 +3393,57 @@ impl PassNode for FullscreenPass {
                         wgpu::BindingResource::Sampler(self.sampler.as_ref().unwrap())
                     }
                     Binding::Uniform => self.uniform.as_ref().unwrap().as_entire_binding(),
+                    Binding::Storage => self.storage.as_ref().unwrap().as_entire_binding(),
                 };
                 (index as u32, resource)
             })
             .collect();
         let bind_group = bind_group(context.device, &self.bind_group_layout, entries);
         fullscreen_pass(context, &self.pipeline, &bind_group, self.output);
+    }
+}
+
+struct AutoExposurePass {
+    pipeline: wgpu::ComputePipeline,
+    exposure_buffer: wgpu::Buffer,
+}
+
+impl PassNode for AutoExposurePass {
+    fn reads(&self) -> Vec<&'static str> {
+        vec!["scene"]
+    }
+
+    fn color_writes(&self) -> Vec<&'static str> {
+        vec!["scene"]
+    }
+
+    fn execute(&mut self, context: &mut PassContext) {
+        let delta_time = context.world.resources.delta_time.min(0.1);
+        context.queue.write_buffer(
+            &self.exposure_buffer,
+            8,
+            bytemuck::cast_slice(&[1.1f32, delta_time]),
+        );
+        let bind = bind_group(
+            context.device,
+            &self.pipeline.get_bind_group_layout(0),
+            vec![
+                (
+                    0,
+                    wgpu::BindingResource::TextureView(read_view(context, "scene")),
+                ),
+                (1, self.exposure_buffer.as_entire_binding()),
+            ],
+        );
+        let mut compute = context
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+        compute.set_pipeline(&self.pipeline);
+        compute.set_bind_group(0, &bind, &[]);
+        compute.dispatch_workgroups(1, 1, 1);
     }
 }
 
@@ -3990,9 +4055,14 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let blur_vertical_pipeline = fullscreen_pipeline(&device, BLUR_SHADER, SCENE_FORMAT);
     let blur_vertical_bind_group_layout = blur_vertical_pipeline.get_bind_group_layout(0);
 
-    let composite_pipeline = fullscreen_pipeline(&device, COMPOSITE_SHADER, surface_config.format);
+    let composite_pipeline = fullscreen_pipeline(&device, COMPOSITE_SHADER, SCENE_FORMAT);
     let composite_bind_group_layout = composite_pipeline.get_bind_group_layout(0);
     let composite_params_buffer = uniform_buffer(&device, 16);
+    let fxaa_pipeline = fullscreen_pipeline(&device, FXAA_SHADER, surface_config.format);
+    let fxaa_bind_group_layout = fxaa_pipeline.get_bind_group_layout(0);
+    let fxaa_params_buffer = uniform_buffer(&device, 16);
+    let auto_exposure_pipeline = compute_pipeline(&device, AUTO_EXPOSURE_SHADER);
+    let exposure_buffer = storage_buffer(&device, 32);
 
     let helmet = fetch_gltf(
         "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb",
@@ -4315,6 +4385,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let bright = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let blur_temp = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let bloom = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
+    let ldr = add_color_resource(&mut graph, false, SCENE_FORMAT, background);
     let skin_pipeline = compute_pipeline(&device, SKIN_COMPUTE_SHADER);
     let joint_buffer = storage_buffer(&device, 64);
     add_pass(
@@ -4357,6 +4428,14 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     );
     add_pass(
         &mut graph,
+        Box::new(AutoExposurePass {
+            pipeline: auto_exposure_pipeline,
+            exposure_buffer: exposure_buffer.clone(),
+        }),
+        &[("scene", scene)],
+    );
+    add_pass(
+        &mut graph,
         Box::new(FullscreenPass {
             pipeline: ssao_pipeline,
             bind_group_layout: ssao_bind_group_layout,
@@ -4368,6 +4447,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             ],
             sampler: None,
             uniform: Some(ssao_data_buffer),
+            storage: None,
             update: Some(ssao_update),
         }),
         &[("depth", depth), ("normals", normals), ("ao_raw", ao_raw)],
@@ -4385,6 +4465,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             ],
             sampler: None,
             uniform: None,
+            storage: None,
             update: None,
         }),
         &[
@@ -4403,6 +4484,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             bindings: vec![Binding::Read("scene"), Binding::Sampler],
             sampler: Some(linear_sampler(&device)),
             uniform: None,
+            storage: None,
             update: None,
         }),
         &[("scene", scene), ("bright", bright)],
@@ -4416,6 +4498,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             bindings: vec![Binding::Read("input"), Binding::Sampler, Binding::Uniform],
             sampler: Some(linear_sampler(&device)),
             uniform: Some(axis_buffer(&device, &queue, [1.0, 0.0, 0.0, 0.0])),
+            storage: None,
             update: None,
         }),
         &[("input", bright), ("output", blur_temp)],
@@ -4429,6 +4512,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             bindings: vec![Binding::Read("input"), Binding::Sampler, Binding::Uniform],
             sampler: Some(linear_sampler(&device)),
             uniform: Some(axis_buffer(&device, &queue, [0.0, 1.0, 0.0, 0.0])),
+            storage: None,
             update: None,
         }),
         &[("input", blur_temp), ("output", bloom)],
@@ -4445,17 +4529,33 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
                 Binding::Read("bloom"),
                 Binding::Read("ao"),
                 Binding::Uniform,
+                Binding::Storage,
             ],
             sampler: Some(linear_sampler(&device)),
             uniform: Some(composite_params_buffer),
+            storage: Some(exposure_buffer.clone()),
             update: Some(composite_update),
         }),
         &[
             ("scene", scene),
             ("bloom", bloom),
             ("ao", ao),
-            ("color", swapchain),
+            ("color", ldr),
         ],
+    );
+    add_pass(
+        &mut graph,
+        Box::new(FullscreenPass {
+            pipeline: fxaa_pipeline,
+            bind_group_layout: fxaa_bind_group_layout,
+            output: "color",
+            bindings: vec![Binding::Read("input"), Binding::Sampler, Binding::Uniform],
+            sampler: Some(linear_sampler(&device)),
+            uniform: Some(fxaa_params_buffer),
+            storage: None,
+            update: Some(fxaa_update),
+        }),
+        &[("input", ldr), ("color", swapchain)],
     );
     render_graph_compile(&mut graph);
 
