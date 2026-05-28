@@ -347,6 +347,7 @@ struct Resources {
     input: Input,
     events: Vec<InputEvent>,
     commands: Vec<SpawnCommand>,
+    bloom_enabled: bool,
 }
 
 #[derive(Default)]
@@ -366,6 +367,7 @@ fn new_world() -> World {
         current_tick: 1,
         resources: Resources {
             viewport: (1.0, 1.0),
+            bloom_enabled: true,
             ..Default::default()
         },
         ..Default::default()
@@ -1434,6 +1436,7 @@ const COMPOSITE_SHADER: &str = "
 @group(0) @binding(1) var scene_sampler: sampler;
 @group(0) @binding(2) var bloom_texture: texture_2d<f32>;
 @group(0) @binding(3) var ao_texture: texture_2d<f32>;
+@group(0) @binding(4) var<uniform> params: vec4<f32>;
 fn aces(color: vec3<f32>) -> vec3<f32> {
     let a = 2.51;
     let b = 0.03;
@@ -1446,7 +1449,7 @@ fn aces(color: vec3<f32>) -> vec3<f32> {
     let scene = textureSample(scene_texture, scene_sampler, in.uv).rgb;
     let bloom = textureSample(bloom_texture, scene_sampler, in.uv).rgb;
     let ao = textureSample(ao_texture, scene_sampler, in.uv).r;
-    return vec4<f32>(aces(scene * ao + bloom * 0.8), 1.0);
+    return vec4<f32>(aces(scene * ao + bloom * params.x), 1.0);
 }
 ";
 
@@ -2295,6 +2298,7 @@ struct CompositePass {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    params_buffer: wgpu::Buffer,
 }
 
 impl PassNode for CompositePass {
@@ -2307,6 +2311,17 @@ impl PassNode for CompositePass {
     }
 
     fn execute(&mut self, context: &mut PassContext) {
+        let bloom: f32 = if context.world.resources.bloom_enabled {
+            0.8
+        } else {
+            0.0
+        };
+        context.queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::cast_slice(&[bloom, 0.0, 0.0, 0.0]),
+        );
+
         let scene_view = read_view(context, "scene");
         let bloom_view = read_view(context, "bloom");
         let ao_view = read_view(context, "ao");
@@ -2331,6 +2346,10 @@ impl PassNode for CompositePass {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::TextureView(ao_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.params_buffer.as_entire_binding(),
                     },
                 ],
             });
@@ -2623,6 +2642,12 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
 
     let composite_pipeline = fullscreen_pipeline(&device, COMPOSITE_SHADER, surface_config.format);
     let composite_bind_group_layout = composite_pipeline.get_bind_group_layout(0);
+    let composite_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
 
     let meshes = vec![
         mesh_gpu(&device, &queue, &TRIANGLE_VERTICES),
@@ -2827,6 +2852,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             pipeline: composite_pipeline,
             bind_group_layout: composite_bind_group_layout,
             sampler: linear_sampler(&device),
+            params_buffer: composite_params_buffer,
         }),
         &[
             ("scene", scene),
@@ -2859,7 +2885,7 @@ fn resize(graphics: &mut Graphics, width: u32, height: u32) {
         .configure(&graphics.device, &graphics.surface_config);
 }
 
-fn render(graphics: &mut Graphics, world: &World) {
+fn render(graphics: &mut Graphics, world: &mut World) {
     let delta_time = world.resources.delta_time;
 
     #[cfg(target_arch = "wasm32")]
@@ -2900,6 +2926,7 @@ fn render(graphics: &mut Graphics, world: &World) {
         .count();
     let physical_targets = graphics.graph.physical_formats.len();
 
+    let mut bloom_enabled = world.resources.bloom_enabled;
     let egui_output = graphics.egui_state.egui_ctx().run_ui(egui_input, |ui| {
         egui::Window::new("engine").show(ui.ctx(), |ui| {
             ui.label("Spinning triangles + emissive cube");
@@ -2907,9 +2934,11 @@ fn render(graphics: &mut Graphics, world: &World) {
             ui.label(format!(
                 "render targets: {logical_targets} logical / {physical_targets} physical"
             ));
+            ui.checkbox(&mut bloom_enabled, "bloom");
             ui.label("drag-left orbit, drag-right pan, scroll zoom");
         });
     });
+    world.resources.bloom_enabled = bloom_enabled;
     graphics
         .egui_state
         .handle_platform_output(&graphics.window, egui_output.platform_output);
@@ -3096,7 +3125,7 @@ impl ApplicationHandler for App {
                 timing_system(&mut self.world);
                 self.state.run_systems(&mut self.world);
                 run_frame_systems(&mut self.world);
-                render(graphics, &self.world);
+                render(graphics, &mut self.world);
                 self.world.resources.input.position_delta = Vec2::zeros();
                 self.world.resources.input.wheel_delta = 0.0;
                 graphics.window.request_redraw();
