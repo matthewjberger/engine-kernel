@@ -966,19 +966,131 @@ fn camera_projection(world: &World, aspect_ratio: f32) -> Option<Mat4> {
     Some(perspective_matrix(&camera.projection, aspect_ratio))
 }
 
-fn sun_view_projection(direction: Vec3) -> Mat4 {
-    let direction = if direction.magnitude() < 0.001 {
-        nalgebra_glm::vec3(0.3, 0.8, 0.5)
-    } else {
-        direction.normalize()
-    };
-    let up = if direction.y.abs() > 0.99 {
-        Vec3::z()
+fn reverse_z_ortho_light(
+    left: f32,
+    right: f32,
+    bottom: f32,
+    top: f32,
+    near: f32,
+    far: f32,
+) -> Mat4 {
+    let width = right - left;
+    let height = top - bottom;
+    let depth = far - near;
+    Mat4::new(
+        2.0 / width,
+        0.0,
+        0.0,
+        -(right + left) / width,
+        0.0,
+        2.0 / height,
+        0.0,
+        -(top + bottom) / height,
+        0.0,
+        0.0,
+        1.0 / depth,
+        -near / depth,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
+}
+
+fn frustum_corners_world(view: &Mat4, y_fov: f32, aspect: f32, near: f32, far: f32) -> [Vec3; 8] {
+    let inverse_view = nalgebra_glm::inverse(view);
+    let tan_half = (y_fov / 2.0).tan();
+    let near_height = near * tan_half;
+    let near_width = near_height * aspect;
+    let far_height = far * tan_half;
+    let far_width = far_height * aspect;
+    let view_corners = [
+        nalgebra_glm::vec3(-near_width, -near_height, -near),
+        nalgebra_glm::vec3(near_width, -near_height, -near),
+        nalgebra_glm::vec3(near_width, near_height, -near),
+        nalgebra_glm::vec3(-near_width, near_height, -near),
+        nalgebra_glm::vec3(-far_width, -far_height, -far),
+        nalgebra_glm::vec3(far_width, -far_height, -far),
+        nalgebra_glm::vec3(far_width, far_height, -far),
+        nalgebra_glm::vec3(-far_width, far_height, -far),
+    ];
+    let mut corners = [Vec3::zeros(); 8];
+    for (index, corner) in view_corners.iter().enumerate() {
+        let world = inverse_view * nalgebra_glm::vec4(corner.x, corner.y, corner.z, 1.0);
+        corners[index] = nalgebra_glm::vec3(world.x, world.y, world.z);
+    }
+    corners
+}
+
+fn cascade_view_projection(
+    corners: &[Vec3; 8],
+    light_direction: Vec3,
+    resolution: f32,
+) -> (Mat4, f32) {
+    let mut center = Vec3::zeros();
+    for corner in corners {
+        center += corner;
+    }
+    center /= 8.0;
+    let mut max_radius = 0.0f32;
+    for corner in corners {
+        max_radius = max_radius.max(nalgebra_glm::length(&(corner - center)));
+    }
+    let up = if light_direction.y.abs() > 0.99 {
+        Vec3::x()
     } else {
         Vec3::y()
     };
-    let view = nalgebra_glm::look_at(&(direction * 18.0), &Vec3::zeros(), &up);
-    nalgebra_glm::ortho_rh_zo(-14.0, 14.0, -14.0, 14.0, 0.1, 40.0) * view
+    let direction = light_direction.normalize();
+    let view = nalgebra_glm::look_at(&(center - direction * max_radius * 4.0), &center, &up);
+    let mut min = nalgebra_glm::vec3(f32::MAX, f32::MAX, f32::MAX);
+    let mut max = nalgebra_glm::vec3(f32::MIN, f32::MIN, f32::MIN);
+    for corner in corners {
+        let light_space = view * nalgebra_glm::vec4(corner.x, corner.y, corner.z, 1.0);
+        min = nalgebra_glm::vec3(
+            min.x.min(light_space.x),
+            min.y.min(light_space.y),
+            min.z.min(light_space.z),
+        );
+        max = nalgebra_glm::vec3(
+            max.x.max(light_space.x),
+            max.y.max(light_space.y),
+            max.z.max(light_space.z),
+        );
+    }
+    let padding = (max.x - min.x).max(max.y - min.y) * 0.1;
+    min.x -= padding;
+    max.x += padding;
+    min.y -= padding;
+    max.y += padding;
+    let z_multiplier = 10.0;
+    let min_z = if min.z < 0.0 {
+        min.z * z_multiplier
+    } else {
+        min.z / z_multiplier
+    };
+    let max_z = if max.z < 0.0 {
+        max.z / z_multiplier
+    } else {
+        max.z * z_multiplier
+    };
+    let projection = reverse_z_ortho_light(min.x, max.x, min.y, max.y, min_z, max_z);
+    (projection * view, (max.x - min.x) / resolution)
+}
+
+fn cascade_splits(near: f32) -> [f32; 4] {
+    let scale = (near / 0.01).max(1e-6);
+    [10.0 * scale, 40.0 * scale, 150.0 * scale, 500.0 * scale]
+}
+
+fn camera_near_fov(world: &World) -> (f32, f32) {
+    if let Some(entity) = world.resources.active_camera
+        && let Some(camera) = get_camera(world, entity)
+    {
+        (camera.projection.z_near, camera.projection.y_fov_radians)
+    } else {
+        (0.01, 45.0_f32.to_radians())
+    }
 }
 
 fn view_projection_matrix(world: &World, aspect_ratio: f32) -> Option<Mat4> {
@@ -1223,7 +1335,6 @@ const SHADER: &str = "
 struct Camera {
     view_projection: mat4x4<f32>,
     view: mat4x4<f32>,
-    sun_view_projection: mat4x4<f32>,
     camera_position: vec4<f32>,
 }
 struct Lights {
@@ -1234,19 +1345,117 @@ struct Lights {
     point_position: array<vec4<f32>, 8>,
     point_color: array<vec4<f32>, 8>,
 }
+struct Shadow {
+    cascade_view_projection: array<mat4x4<f32>, 4>,
+    split_distances: vec4<f32>,
+    atlas_offset: array<vec4<f32>, 4>,
+    atlas_scale: vec4<f32>,
+    params: vec4<f32>,
+}
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<uniform> lights: Lights;
 @group(0) @binding(2) var shadow_texture: texture_depth_2d;
-@group(0) @binding(3) var shadow_sampler: sampler_comparison;
+@group(0) @binding(3) var shadow_sampler: sampler;
+@group(0) @binding(4) var<uniform> shadow: Shadow;
 
-fn shadow_factor(world_position: vec3<f32>, n_dot_l: f32) -> f32 {
-    let light_clip = camera.sun_view_projection * vec4<f32>(world_position, 1.0);
-    let ndc = light_clip.xyz / light_clip.w;
-    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * -0.5 + 0.5);
-    let bias = max(0.0025 * (1.0 - n_dot_l), 0.0006);
-    let lit = textureSampleCompareLevel(shadow_texture, shadow_sampler, uv, ndc.z - bias);
-    let inside = ndc.z <= 1.0 && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
-    return select(1.0, lit, inside);
+const POISSON_8: array<vec2<f32>, 8> = array<vec2<f32>, 8>(
+    vec2<f32>(-0.7071, -0.7071),
+    vec2<f32>(0.7071, -0.7071),
+    vec2<f32>(-0.7071, 0.7071),
+    vec2<f32>(0.7071, 0.7071),
+    vec2<f32>(-1.0, 0.0),
+    vec2<f32>(1.0, 0.0),
+    vec2<f32>(0.0, -1.0),
+    vec2<f32>(0.0, 1.0),
+);
+const POISSON_16: array<vec2<f32>, 16> = array<vec2<f32>, 16>(
+    vec2<f32>(-0.94201624, -0.39906216),
+    vec2<f32>(0.94558609, -0.76890725),
+    vec2<f32>(-0.094184101, -0.92938870),
+    vec2<f32>(0.34495938, 0.29387760),
+    vec2<f32>(-0.91588581, 0.45771432),
+    vec2<f32>(-0.81544232, -0.87912464),
+    vec2<f32>(-0.38277543, 0.27676845),
+    vec2<f32>(0.97484398, 0.75648379),
+    vec2<f32>(0.44323325, -0.97511554),
+    vec2<f32>(0.53742981, -0.47373420),
+    vec2<f32>(-0.26496911, -0.41893023),
+    vec2<f32>(0.79197514, 0.19090188),
+    vec2<f32>(-0.24188840, 0.99706507),
+    vec2<f32>(-0.81409955, 0.91437590),
+    vec2<f32>(0.19984126, 0.78641367),
+    vec2<f32>(0.14383161, -0.14100790),
+);
+
+fn select_cascade(view_depth: f32) -> i32 {
+    for (var index = 0; index < 4; index = index + 1) {
+        if view_depth < shadow.split_distances[index] {
+            return index;
+        }
+    }
+    return 3;
+}
+
+fn sample_cascade(world_position: vec3<f32>, world_normal: vec3<f32>, cascade: i32) -> f32 {
+    let texel_world = shadow.atlas_offset[cascade].z;
+    let offset_position = world_position + world_normal * shadow.params.y * texel_world;
+    let clip = shadow.cascade_view_projection[cascade] * vec4<f32>(offset_position, 1.0);
+    let ndc = clip.xyz / clip.w;
+    let scale = shadow.atlas_scale.x;
+    let atlas_offset = shadow.atlas_offset[cascade].xy;
+    let uv = (ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5)) * scale + atlas_offset;
+    let depth = ndc.z + shadow.params.z;
+    let slot_min = atlas_offset;
+    let slot_max = atlas_offset + scale;
+    let in_bounds = uv.x >= slot_min.x && uv.x <= slot_max.x && uv.y >= slot_min.y && uv.y <= slot_max.y && ndc.z >= 0.0 && ndc.z <= 1.0;
+    if !in_bounds {
+        return 1.0;
+    }
+    let texel = 1.0 / 2048.0;
+    let safe_min = slot_min + scale * 0.01;
+    let safe_max = slot_max - scale * 0.01;
+    let light_size = shadow.params.x;
+    var blocker_sum = 0.0;
+    var blockers = 0u;
+    for (var index = 0; index < 8; index = index + 1) {
+        let sample_uv = clamp(uv + POISSON_8[index] * texel * light_size * 10.0, safe_min, safe_max);
+        let sampled = textureSampleLevel(shadow_texture, shadow_sampler, sample_uv, 0);
+        if sampled > depth {
+            blocker_sum += sampled;
+            blockers += 1u;
+        }
+    }
+    if blockers == 0u {
+        return 1.0;
+    }
+    let average = blocker_sum / f32(blockers);
+    let penumbra = (average - depth) / max(1.0 - average, 0.001);
+    let filter_radius = clamp(penumbra * light_size * 20.0, 1.0, 8.0);
+    var visibility = 0.0;
+    for (var index = 0; index < 16; index = index + 1) {
+        let sample_uv = clamp(uv + POISSON_16[index] * texel * filter_radius, safe_min, safe_max);
+        let sampled = textureSampleLevel(shadow_texture, shadow_sampler, sample_uv, 0);
+        visibility += select(0.0, 1.0, depth >= sampled);
+    }
+    return visibility / 16.0;
+}
+
+fn calculate_shadow(world_position: vec3<f32>, world_normal: vec3<f32>, view_depth: f32) -> f32 {
+    if shadow.params.w < 0.5 {
+        return 1.0;
+    }
+    let cascade = select_cascade(view_depth);
+    let factor = sample_cascade(world_position, world_normal, cascade);
+    if cascade < 3 {
+        let cascade_end = shadow.split_distances[cascade];
+        let blend_range = cascade_end * 0.25;
+        let blend_start = cascade_end - blend_range;
+        if view_depth > blend_start {
+            let blend = (view_depth - blend_start) / blend_range;
+            return mix(factor, sample_cascade(world_position, world_normal, cascade + 1), blend);
+        }
+    }
+    return factor;
 }
 
 struct VertexInput {
@@ -1326,8 +1535,9 @@ fn lighting(
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
     var color = lights.ambient.rgb * albedo;
     let sun = lights.sun_direction.xyz;
-    let shadow = shadow_factor(world_position, max(dot(normal, sun), 0.0));
-    color += brdf(normal, view, sun, lights.sun_color.rgb * shadow, albedo, metallic, roughness, f0);
+    let view_depth = -(camera.view * vec4<f32>(world_position, 1.0)).z;
+    let sun_shadow = calculate_shadow(world_position, normal, view_depth);
+    color += brdf(normal, view, sun, lights.sun_color.rgb * sun_shadow, albedo, metallic, roughness, f0);
     let count = u32(lights.point_count.x);
     for (var index = 0u; index < count; index = index + 1u) {
         let to_light = lights.point_position[index].xyz - world_position;
@@ -1370,12 +1580,7 @@ fn lighting(
 ";
 
 const SHADOW_SHADER: &str = "
-struct Camera {
-    view_projection: mat4x4<f32>,
-    view: mat4x4<f32>,
-    sun_view_projection: mat4x4<f32>,
-}
-@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(0) var<uniform> cascade_view_projection: mat4x4<f32>;
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(2) model_0: vec4<f32>,
@@ -1385,7 +1590,7 @@ struct VertexInput {
 }
 @vertex fn vs(in: VertexInput) -> @builtin(position) vec4<f32> {
     let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
-    return camera.sun_view_projection * model * vec4<f32>(in.position, 1.0);
+    return cascade_view_projection * model * vec4<f32>(in.position, 1.0);
 }
 ";
 
@@ -1947,7 +2152,9 @@ struct GeometryPass {
     pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     shadow_view: wgpu::TextureView,
-    shadow_bind_group: wgpu::BindGroup,
+    cascade_buffers: [wgpu::Buffer; 4],
+    cascade_bind_groups: [wgpu::BindGroup; 4],
+    shadow_buffer: wgpu::Buffer,
     meshes: Vec<MeshGpu>,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
@@ -2014,18 +2221,54 @@ impl PassNode for GeometryPass {
 
         let lights = gather_lights(context.world);
         let sun = nalgebra_glm::vec3(lights[4], lights[5], lights[6]);
-        let sun_view_projection = sun_view_projection(sun);
         let camera_position = view
             .try_inverse()
             .map_or(Vec3::zeros(), |inverse| transform_translation(&inverse));
-        let mut camera_data = [0.0f32; 52];
+        let mut camera_data = [0.0f32; 36];
         camera_data[..16].copy_from_slice(view_projection.as_slice());
         camera_data[16..32].copy_from_slice(view.as_slice());
-        camera_data[32..48].copy_from_slice(sun_view_projection.as_slice());
-        camera_data[48..51].copy_from_slice(camera_position.as_slice());
+        camera_data[32..35].copy_from_slice(camera_position.as_slice());
         context
             .queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&camera_data));
+
+        let (near, y_fov) = camera_near_fov(context.world);
+        let splits = cascade_splits(near);
+        let light_travel = -sun;
+        let mut shadow_data = [0.0f32; 92];
+        for cascade in 0..4 {
+            let cascade_near = if cascade == 0 {
+                near
+            } else {
+                splits[cascade - 1]
+            };
+            let corners = frustum_corners_world(
+                &view,
+                y_fov,
+                context.aspect_ratio,
+                cascade_near,
+                splits[cascade],
+            );
+            let (cascade_vp, texel_world) = cascade_view_projection(&corners, light_travel, 1024.0);
+            shadow_data[cascade * 16..cascade * 16 + 16].copy_from_slice(cascade_vp.as_slice());
+            shadow_data[68 + cascade * 4] = (cascade % 2) as f32 * 0.5;
+            shadow_data[68 + cascade * 4 + 1] = (cascade / 2) as f32 * 0.5;
+            shadow_data[68 + cascade * 4 + 2] = texel_world;
+            context.queue.write_buffer(
+                &self.cascade_buffers[cascade],
+                0,
+                bytemuck::cast_slice(cascade_vp.as_slice()),
+            );
+        }
+        shadow_data[64..68].copy_from_slice(&splits);
+        shadow_data[84] = 0.5;
+        shadow_data[88] = 1.0;
+        shadow_data[89] = 2.0;
+        shadow_data[90] = 0.0008;
+        shadow_data[91] = 1.0;
+        context
+            .queue
+            .write_buffer(&self.shadow_buffer, 0, bytemuck::cast_slice(&shadow_data));
         context
             .queue
             .write_buffer(&self.lights_buffer, 0, bytemuck::cast_slice(&lights));
@@ -2056,7 +2299,12 @@ impl PassNode for GeometryPass {
             counts.push(count);
         }
 
-        {
+        for cascade in 0..4 {
+            let load = if cascade == 0 {
+                wgpu::LoadOp::Clear(0.0)
+            } else {
+                wgpu::LoadOp::Load
+            };
             let mut shadow_pass = context
                 .encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2064,15 +2312,19 @@ impl PassNode for GeometryPass {
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &self.shadow_view,
                         depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
+                            load,
                             store: wgpu::StoreOp::Store,
                         }),
                         stencil_ops: None,
                     }),
                     ..Default::default()
                 });
+            let slot_x = (cascade % 2) as f32 * 1024.0;
+            let slot_y = (cascade / 2) as f32 * 1024.0;
+            shadow_pass.set_viewport(slot_x, slot_y, 1024.0, 1024.0, 0.0, 1.0);
+            shadow_pass.set_scissor_rect(slot_x as u32, slot_y as u32, 1024, 1024);
             shadow_pass.set_pipeline(&self.shadow_pipeline);
-            shadow_pass.set_bind_group(0, &self.shadow_bind_group, &[]);
+            shadow_pass.set_bind_group(0, &self.cascade_bind_groups[cascade], &[]);
             for (handle, mesh) in self.meshes.iter().enumerate() {
                 if counts[handle] > 0 {
                     shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -2531,7 +2783,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: Default::default(),
             bias: Default::default(),
         }),
@@ -2555,7 +2807,6 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     });
     let shadow_view = shadow_texture.create_view(&Default::default());
     let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        compare: Some(wgpu::CompareFunction::LessEqual),
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
@@ -2578,8 +2829,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         mesh_gpu(&device, &queue, &CUBE_VERTICES),
     ];
 
-    let camera_buffer = uniform_buffer(&device, 208);
+    let camera_buffer = uniform_buffer(&device, 144);
     let lights_buffer = uniform_buffer(&device, 320);
+    let shadow_buffer = uniform_buffer(&device, 368);
     let geometry_bind_group = bind_group(
         &device,
         &pipeline.get_bind_group_layout(0),
@@ -2588,13 +2840,17 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             (1, lights_buffer.as_entire_binding()),
             (2, wgpu::BindingResource::TextureView(&shadow_view)),
             (3, wgpu::BindingResource::Sampler(&shadow_sampler)),
+            (4, shadow_buffer.as_entire_binding()),
         ],
     );
-    let shadow_bind_group = bind_group(
-        &device,
-        &shadow_pipeline.get_bind_group_layout(0),
-        vec![(0, camera_buffer.as_entire_binding())],
-    );
+    let cascade_buffers: [wgpu::Buffer; 4] = std::array::from_fn(|_| uniform_buffer(&device, 64));
+    let cascade_bind_groups: [wgpu::BindGroup; 4] = std::array::from_fn(|index| {
+        bind_group(
+            &device,
+            &shadow_pipeline.get_bind_group_layout(0),
+            vec![(0, cascade_buffers[index].as_entire_binding())],
+        )
+    });
 
     let ssao_pipeline = fullscreen_pipeline(&device, SSAO_SHADER, SCENE_FORMAT);
     let ssao_bind_group_layout = ssao_pipeline.get_bind_group_layout(0);
@@ -2643,7 +2899,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             pipeline,
             shadow_pipeline,
             shadow_view,
-            shadow_bind_group,
+            cascade_buffers,
+            cascade_bind_groups,
+            shadow_buffer,
             meshes,
             camera_buffer,
             lights_buffer,
