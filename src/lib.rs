@@ -1007,6 +1007,29 @@ fn reverse_z_ortho_light(
     )
 }
 
+fn reverse_z_perspective(y_fov: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+    let focal = 1.0 / (y_fov / 2.0).tan();
+    let depth = far - near;
+    Mat4::new(
+        focal / aspect,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        focal,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        near / depth,
+        near * far / depth,
+        0.0,
+        0.0,
+        -1.0,
+        0.0,
+    )
+}
+
 fn frustum_corners_world(view: &Mat4, y_fov: f32, aspect: f32, near: f32, far: f32) -> [Vec3; 8] {
     let inverse_view = nalgebra_glm::inverse(view);
     let tan_half = (y_fov / 2.0).tan();
@@ -1136,12 +1159,13 @@ fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3, Material)> {
     instances
 }
 
-fn gather_lights(world: &World) -> [f32; 112] {
-    let mut data = [0.0f32; 112];
+fn gather_lights(world: &World) -> ([f32; 144], Vec<Mat4>) {
+    let mut data = [0.0f32; 144];
     data[0] = 0.03;
     data[1] = 0.03;
     data[2] = 0.04;
     let mut point_count = 0usize;
+    let mut spot_shadows = Vec::new();
     for table in &world.tables {
         if table.mask & (LIGHT | GLOBAL_TRANSFORM) != (LIGHT | GLOBAL_TRANSFORM) {
             continue;
@@ -1173,6 +1197,8 @@ fn gather_lights(world: &World) -> [f32; 112] {
                     data[color_slot + 1] = color.y;
                     data[color_slot + 2] = color.z;
                     let direction_slot = 80 + point_count * 4;
+                    let shadow_slot = 112 + point_count * 4;
+                    data[shadow_slot] = -1.0;
                     if light.kind == LightKind::Spot {
                         let direction = transform_forward(&global);
                         data[direction_slot] = direction.x;
@@ -1180,6 +1206,23 @@ fn gather_lights(world: &World) -> [f32; 112] {
                         data[direction_slot + 2] = direction.z;
                         data[direction_slot + 3] = light.outer_cone.cos();
                         data[color_slot + 3] = light.inner_cone.cos();
+                        if spot_shadows.len() < 4 {
+                            let up = if direction.y.abs() > 0.99 {
+                                Vec3::x()
+                            } else {
+                                Vec3::y()
+                            };
+                            let view =
+                                nalgebra_glm::look_at(&position, &(position + direction), &up);
+                            let projection = reverse_z_perspective(
+                                light.outer_cone * 2.0,
+                                1.0,
+                                0.1,
+                                light.range.max(1.0),
+                            );
+                            data[shadow_slot] = spot_shadows.len() as f32;
+                            spot_shadows.push(projection * view);
+                        }
                     } else {
                         data[direction_slot + 3] = -2.0;
                         data[color_slot + 3] = -2.0;
@@ -1191,7 +1234,7 @@ fn gather_lights(world: &World) -> [f32; 112] {
         }
     }
     data[12] = point_count as f32;
-    data
+    (data, spot_shadows)
 }
 
 fn timing_system(world: &mut World) {
@@ -1385,6 +1428,7 @@ struct Lights {
     point_position: array<vec4<f32>, 8>,
     point_color: array<vec4<f32>, 8>,
     point_direction: array<vec4<f32>, 8>,
+    point_shadow: array<vec4<f32>, 8>,
 }
 struct Shadow {
     cascade_view_projection: array<mat4x4<f32>, 4>,
@@ -1393,11 +1437,17 @@ struct Shadow {
     atlas_scale: vec4<f32>,
     params: vec4<f32>,
 }
+struct SpotShadow {
+    view_projection: array<mat4x4<f32>, 4>,
+    atlas_rect: array<vec4<f32>, 4>,
+}
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<uniform> lights: Lights;
 @group(0) @binding(2) var shadow_texture: texture_depth_2d;
 @group(0) @binding(3) var shadow_sampler: sampler;
 @group(0) @binding(4) var<uniform> shadow: Shadow;
+@group(0) @binding(5) var spotlight_atlas: texture_depth_2d;
+@group(0) @binding(6) var<uniform> spot_shadow: SpotShadow;
 
 const POISSON_8: array<vec2<f32>, 8> = array<vec2<f32>, 8>(
     vec2<f32>(-0.7071, -0.7071),
@@ -1499,6 +1549,53 @@ fn calculate_shadow(world_position: vec3<f32>, world_normal: vec3<f32>, view_dep
     return factor;
 }
 
+fn spot_shadow_factor(world_position: vec3<f32>, shadow_index: i32) -> f32 {
+    if shadow_index < 0 {
+        return 1.0;
+    }
+    let clip = spot_shadow.view_projection[shadow_index] * vec4<f32>(world_position, 1.0);
+    if clip.w <= 0.0 {
+        return 1.0;
+    }
+    let ndc = clip.xyz / clip.w;
+    let rect = spot_shadow.atlas_rect[shadow_index];
+    let scale = rect.z;
+    let uv = (ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5)) * scale + rect.xy;
+    let depth = ndc.z + rect.w;
+    let slot_min = rect.xy;
+    let slot_max = rect.xy + scale;
+    let in_bounds = uv.x >= slot_min.x && uv.x <= slot_max.x && uv.y >= slot_min.y && uv.y <= slot_max.y && ndc.z >= 0.0 && ndc.z <= 1.0;
+    if !in_bounds {
+        return 1.0;
+    }
+    let texel = 1.0 / 2048.0;
+    let safe_min = slot_min + scale * 0.01;
+    let safe_max = slot_max - scale * 0.01;
+    var blocker_sum = 0.0;
+    var blockers = 0u;
+    for (var index = 0; index < 8; index = index + 1) {
+        let sample_uv = clamp(uv + POISSON_8[index] * texel * 15.0, safe_min, safe_max);
+        let sampled = textureSampleLevel(spotlight_atlas, shadow_sampler, sample_uv, 0);
+        if sampled > depth {
+            blocker_sum += sampled;
+            blockers += 1u;
+        }
+    }
+    if blockers == 0u {
+        return 1.0;
+    }
+    let average = blocker_sum / f32(blockers);
+    let penumbra = (average - depth) / max(1.0 - average, 0.001);
+    let filter_radius = clamp(penumbra * 30.0, 0.5, 6.0);
+    var visibility = 0.0;
+    for (var index = 0; index < 16; index = index + 1) {
+        let sample_uv = clamp(uv + POISSON_16[index] * texel * filter_radius, safe_min, safe_max);
+        let sampled = textureSampleLevel(spotlight_atlas, shadow_sampler, sample_uv, 0);
+        visibility += select(0.0, 1.0, depth >= sampled);
+    }
+    return visibility / 16.0;
+}
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) color: vec3<f32>,
@@ -1597,7 +1694,8 @@ fn lighting(
             lights.point_direction[index].w,
             lights.point_color[index].w,
         );
-        let radiance = lights.point_color[index].rgb * attenuation * spot;
+        let spot_visibility = spot_shadow_factor(world_position, i32(lights.point_shadow[index].x));
+        let radiance = lights.point_color[index].rgb * attenuation * spot * spot_visibility;
         color += brdf(normal, view, to_light / distance, radiance, albedo, metallic, roughness, f0);
     }
     return color;
@@ -2209,6 +2307,10 @@ struct GeometryPass {
     cascade_buffers: [wgpu::Buffer; 4],
     cascade_bind_groups: [wgpu::BindGroup; 4],
     shadow_buffer: wgpu::Buffer,
+    spot_atlas_view: wgpu::TextureView,
+    spot_buffers: [wgpu::Buffer; 4],
+    spot_bind_groups: [wgpu::BindGroup; 4],
+    spot_shadow_buffer: wgpu::Buffer,
     meshes: Vec<MeshGpu>,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
@@ -2273,7 +2375,7 @@ impl PassNode for GeometryPass {
             .unwrap_or_else(Mat4::identity);
         let view = camera_view(context.world).unwrap_or_else(Mat4::identity);
 
-        let lights = gather_lights(context.world);
+        let (lights, spot_shadows) = gather_lights(context.world);
         let sun = nalgebra_glm::vec3(lights[4], lights[5], lights[6]);
         let camera_position = view
             .try_inverse()
@@ -2326,6 +2428,25 @@ impl PassNode for GeometryPass {
         context
             .queue
             .write_buffer(&self.lights_buffer, 0, bytemuck::cast_slice(&lights));
+
+        let mut spot_shadow_data = [0.0f32; 80];
+        for (slot, spot_vp) in spot_shadows.iter().enumerate() {
+            spot_shadow_data[slot * 16..slot * 16 + 16].copy_from_slice(spot_vp.as_slice());
+            spot_shadow_data[64 + slot * 4] = (slot % 2) as f32 * 0.5;
+            spot_shadow_data[64 + slot * 4 + 1] = (slot / 2) as f32 * 0.5;
+            spot_shadow_data[64 + slot * 4 + 2] = 0.5;
+            spot_shadow_data[64 + slot * 4 + 3] = 0.0008;
+            context.queue.write_buffer(
+                &self.spot_buffers[slot],
+                0,
+                bytemuck::cast_slice(spot_vp.as_slice()),
+            );
+        }
+        context.queue.write_buffer(
+            &self.spot_shadow_buffer,
+            0,
+            bytemuck::cast_slice(&spot_shadow_data),
+        );
 
         let mut counts = Vec::with_capacity(self.meshes.len());
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
@@ -2384,6 +2505,41 @@ impl PassNode for GeometryPass {
                     shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     shadow_pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
                     shadow_pass.draw(0..mesh.vertex_count, 0..counts[handle]);
+                }
+            }
+        }
+
+        for slot in 0..spot_shadows.len() {
+            let load = if slot == 0 {
+                wgpu::LoadOp::Clear(0.0)
+            } else {
+                wgpu::LoadOp::Load
+            };
+            let mut spot_pass = context
+                .encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.spot_atlas_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+            let slot_x = (slot % 2) as f32 * 1024.0;
+            let slot_y = (slot / 2) as f32 * 1024.0;
+            spot_pass.set_viewport(slot_x, slot_y, 1024.0, 1024.0, 0.0, 1.0);
+            spot_pass.set_scissor_rect(slot_x as u32, slot_y as u32, 1024, 1024);
+            spot_pass.set_pipeline(&self.shadow_pipeline);
+            spot_pass.set_bind_group(0, &self.spot_bind_groups[slot], &[]);
+            for (handle, mesh) in self.meshes.iter().enumerate() {
+                if counts[handle] > 0 {
+                    spot_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    spot_pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
+                    spot_pass.draw(0..mesh.vertex_count, 0..counts[handle]);
                 }
             }
         }
@@ -2860,6 +3016,21 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         view_formats: &[],
     });
     let shadow_view = shadow_texture.create_view(&Default::default());
+    let spot_atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 2048,
+            height: 2048,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let spot_atlas_view = spot_atlas_texture.create_view(&Default::default());
     let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
@@ -2884,8 +3055,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     ];
 
     let camera_buffer = uniform_buffer(&device, 144);
-    let lights_buffer = uniform_buffer(&device, 448);
+    let lights_buffer = uniform_buffer(&device, 576);
     let shadow_buffer = uniform_buffer(&device, 368);
+    let spot_shadow_buffer = uniform_buffer(&device, 320);
     let geometry_bind_group = bind_group(
         &device,
         &pipeline.get_bind_group_layout(0),
@@ -2895,6 +3067,8 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             (2, wgpu::BindingResource::TextureView(&shadow_view)),
             (3, wgpu::BindingResource::Sampler(&shadow_sampler)),
             (4, shadow_buffer.as_entire_binding()),
+            (5, wgpu::BindingResource::TextureView(&spot_atlas_view)),
+            (6, spot_shadow_buffer.as_entire_binding()),
         ],
     );
     let cascade_buffers: [wgpu::Buffer; 4] = std::array::from_fn(|_| uniform_buffer(&device, 64));
@@ -2903,6 +3077,14 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             &device,
             &shadow_pipeline.get_bind_group_layout(0),
             vec![(0, cascade_buffers[index].as_entire_binding())],
+        )
+    });
+    let spot_buffers: [wgpu::Buffer; 4] = std::array::from_fn(|_| uniform_buffer(&device, 64));
+    let spot_bind_groups: [wgpu::BindGroup; 4] = std::array::from_fn(|index| {
+        bind_group(
+            &device,
+            &shadow_pipeline.get_bind_group_layout(0),
+            vec![(0, spot_buffers[index].as_entire_binding())],
         )
     });
 
@@ -2956,6 +3138,10 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             cascade_buffers,
             cascade_bind_groups,
             shadow_buffer,
+            spot_atlas_view,
+            spot_buffers,
+            spot_bind_groups,
+            spot_shadow_buffer,
             meshes,
             camera_buffer,
             lights_buffer,
