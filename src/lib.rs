@@ -89,6 +89,23 @@ struct Light {
 }
 
 #[derive(Clone, Copy)]
+struct Material {
+    albedo: Vec3,
+    metallic: f32,
+    roughness: f32,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            albedo: Vec3::new(1.0, 1.0, 1.0),
+            metallic: 0.0,
+            roughness: 0.6,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct PerspectiveCamera {
     y_fov_radians: f32,
     z_near: f32,
@@ -253,6 +270,7 @@ components!(
     RENDER_MESH           => RenderMesh,          render_meshes;
     EMISSIVE              => Emissive,            emissives;
     LIGHT                 => Light,               lights;
+    MATERIAL              => Material,            materials;
 );
 
 type System = fn(&mut World);
@@ -334,6 +352,7 @@ struct SpawnCommand {
     transform: LocalTransform,
     render_mesh: u32,
     emissive: Vec3,
+    material: Material,
 }
 
 #[derive(Default)]
@@ -632,6 +651,13 @@ fn get_light_mut(world: &mut World, entity: Entity) -> Option<&mut Light> {
     })
 }
 
+fn get_material_mut(world: &mut World, entity: Entity) -> Option<&mut Material> {
+    component_mut(world, entity, MATERIAL, |table, row, tick| {
+        table.materials[row].1 = tick;
+        &mut table.materials[row].0
+    })
+}
+
 fn collect_entities(world: &mut World, mask: u64) -> Vec<Entity> {
     let mut entities = Vec::new();
     for table in query_tables(world, mask).to_vec() {
@@ -795,6 +821,9 @@ fn process_commands_system(world: &mut World) {
         if let Some(emissive) = get_emissive_mut(world, entity) {
             emissive.0 = command.emissive;
         }
+        if let Some(material) = get_material_mut(world, entity) {
+            *material = command.material;
+        }
         mark_local_transform_dirty(world, entity);
     }
 }
@@ -956,13 +985,14 @@ fn view_projection_matrix(world: &World, aspect_ratio: f32) -> Option<Mat4> {
     Some(camera_projection(world, aspect_ratio)? * camera_view(world)?)
 }
 
-fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3)> {
+fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3, Material)> {
     let mut instances = Vec::new();
     for table in &world.tables {
         if table.mask & (RENDER_MESH | GLOBAL_TRANSFORM) != (RENDER_MESH | GLOBAL_TRANSFORM) {
             continue;
         }
         let emissive_table = table.mask & EMISSIVE != 0;
+        let material_table = table.mask & MATERIAL != 0;
         for row in 0..table.entities.len() {
             if table.render_meshes[row].0.0 != handle {
                 continue;
@@ -973,7 +1003,12 @@ fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3)> {
             } else {
                 Vec3::zeros()
             };
-            instances.push((model, emissive));
+            let material = if material_table {
+                table.materials[row].0
+            } else {
+                Material::default()
+            };
+            instances.push((model, emissive, material));
         }
     }
     instances
@@ -1114,7 +1149,7 @@ impl State for Demo {
         for index in 0..count {
             let angle = index as f32 / count as f32 * std::f32::consts::TAU;
             world.resources.commands.push(SpawnCommand {
-                mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH,
+                mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | MATERIAL,
                 transform: LocalTransform {
                     translation: nalgebra_glm::vec3(angle.cos() * 3.0, 0.0, angle.sin() * 3.0),
                     rotation: nalgebra_glm::quat_angle_axis(angle, &Vec3::y()),
@@ -1122,6 +1157,11 @@ impl State for Demo {
                 },
                 render_mesh: 0,
                 emissive: Vec3::zeros(),
+                material: Material {
+                    albedo: nalgebra_glm::vec3(1.0, 1.0, 1.0),
+                    metallic: 0.85,
+                    roughness: 0.35,
+                },
             });
         }
 
@@ -1133,6 +1173,7 @@ impl State for Demo {
             },
             render_mesh: 1,
             emissive: nalgebra_glm::vec3(4.0, 2.2, 0.8),
+            material: Material::default(),
         });
 
         world.resources.commands.push(SpawnCommand {
@@ -1144,6 +1185,7 @@ impl State for Demo {
             },
             render_mesh: 1,
             emissive: nalgebra_glm::vec3(0.6, 0.6, 0.6),
+            material: Material::default(),
         });
     }
 }
@@ -1180,6 +1222,7 @@ struct Camera {
     view_projection: mat4x4<f32>,
     view: mat4x4<f32>,
     sun_view_projection: mat4x4<f32>,
+    camera_position: vec4<f32>,
 }
 struct Lights {
     ambient: vec4<f32>,
@@ -1214,6 +1257,7 @@ struct VertexInput {
     @location(4) model_2: vec4<f32>,
     @location(5) model_3: vec4<f32>,
     @location(6) emissive: vec4<f32>,
+    @location(8) albedo_metallic: vec4<f32>,
 }
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -1223,27 +1267,70 @@ struct VertexOutput {
     @location(3) view_normal: vec3<f32>,
     @location(4) world_position: vec3<f32>,
     @location(5) world_normal: vec3<f32>,
+    @location(6) @interpolate(flat) albedo: vec3<f32>,
+    @location(7) @interpolate(flat) material: vec2<f32>,
 }
 struct GeometryOutput {
     @location(0) color: vec4<f32>,
     @location(1) normal: vec4<f32>,
 }
-fn lighting(albedo: vec3<f32>, world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
-    var radiance = lights.ambient.rgb;
-    let n_dot_sun = max(dot(normal, lights.sun_direction.xyz), 0.0);
-    radiance += lights.sun_color.rgb * n_dot_sun * shadow_factor(world_position, n_dot_sun);
+fn distribution_ggx(n_dot_h: f32, roughness: f32) -> f32 {
+    let a = roughness * roughness;
+    let a2 = a * a;
+    let d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / max(3.14159265 * d * d, 0.0001);
+}
+fn geometry_schlick(n_dot: f32, roughness: f32) -> f32 {
+    let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+    return n_dot / (n_dot * (1.0 - k) + k);
+}
+fn fresnel(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
+    return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+fn brdf(
+    normal: vec3<f32>,
+    view: vec3<f32>,
+    light: vec3<f32>,
+    radiance: vec3<f32>,
+    albedo: vec3<f32>,
+    metallic: f32,
+    roughness: f32,
+    f0: vec3<f32>,
+) -> vec3<f32> {
+    let half = normalize(view + light);
+    let n_dot_l = max(dot(normal, light), 0.0);
+    let n_dot_v = max(dot(normal, view), 0.0001);
+    let n_dot_h = max(dot(normal, half), 0.0);
+    let d = distribution_ggx(n_dot_h, roughness);
+    let g = geometry_schlick(n_dot_v, roughness) * geometry_schlick(n_dot_l, roughness);
+    let f = fresnel(max(dot(half, view), 0.0), f0);
+    let specular = (d * g * f) / max(4.0 * n_dot_v * n_dot_l, 0.0001);
+    let diffuse = (vec3<f32>(1.0) - f) * (1.0 - metallic) * albedo / 3.14159265;
+    return (diffuse + specular) * radiance * n_dot_l;
+}
+fn lighting(
+    albedo: vec3<f32>,
+    world_position: vec3<f32>,
+    normal: vec3<f32>,
+    view: vec3<f32>,
+    metallic: f32,
+    roughness: f32,
+) -> vec3<f32> {
+    let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+    var color = lights.ambient.rgb * albedo;
+    let sun = lights.sun_direction.xyz;
+    let shadow = shadow_factor(world_position, max(dot(normal, sun), 0.0));
+    color += brdf(normal, view, sun, lights.sun_color.rgb * shadow, albedo, metallic, roughness, f0);
     let count = u32(lights.point_count.x);
     for (var index = 0u; index < count; index = index + 1u) {
         let to_light = lights.point_position[index].xyz - world_position;
         let distance = max(length(to_light), 0.0001);
         let range = max(lights.point_position[index].w, 0.0001);
         let attenuation = clamp(1.0 - distance / range, 0.0, 1.0);
-        radiance += lights.point_color[index].rgb
-            * max(dot(normal, to_light / distance), 0.0)
-            * attenuation
-            * attenuation;
+        let radiance = lights.point_color[index].rgb * attenuation * attenuation;
+        color += brdf(normal, view, to_light / distance, radiance, albedo, metallic, roughness, f0);
     }
-    return albedo * radiance;
+    return color;
 }
 @vertex fn vs(in: VertexInput, @builtin(instance_index) instance_index: u32) -> VertexOutput {
     let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
@@ -1259,13 +1346,17 @@ fn lighting(albedo: vec3<f32>, world_position: vec3<f32>, normal: vec3<f32>) -> 
         view_normal,
         world.xyz,
         world_normal,
+        in.albedo_metallic.rgb,
+        vec2<f32>(in.albedo_metallic.w, in.emissive.w),
     );
 }
 @fragment fn fs(in: VertexOutput) -> GeometryOutput {
     let tint = tints[in.instance % 64u].rgb;
     let emissive_surface = in.emissive.r + in.emissive.g + in.emissive.b > 0.0;
     let normal = normalize(in.world_normal);
-    let lit = lighting(in.color.rgb * tint, in.world_position, normal);
+    let view = normalize(camera.camera_position.xyz - in.world_position);
+    let albedo = in.color.rgb * tint * in.albedo;
+    let lit = lighting(albedo, in.world_position, normal, view, in.material.x, max(in.material.y, 0.04));
     let shaded = select(lit, in.color.rgb * in.emissive, emissive_surface);
     var out: GeometryOutput;
     out.color = vec4<f32>(shaded, 1.0);
@@ -1946,7 +2037,7 @@ fn upload_instances(
         *capacity = count.next_power_of_two();
         *buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: *capacity as u64 * 80,
+            size: *capacity as u64 * 96,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1966,7 +2057,7 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
     queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 80,
+        size: 96,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -1999,10 +2090,14 @@ impl PassNode for GeometryPass {
         let lights = gather_lights(context.world);
         let sun = nalgebra_glm::vec3(lights[4], lights[5], lights[6]);
         let sun_view_projection = sun_view_projection(sun);
-        let mut camera_data = [0.0f32; 48];
+        let camera_position = view
+            .try_inverse()
+            .map_or(Vec3::zeros(), |inverse| transform_translation(&inverse));
+        let mut camera_data = [0.0f32; 52];
         camera_data[..16].copy_from_slice(view_projection.as_slice());
         camera_data[16..32].copy_from_slice(view.as_slice());
-        camera_data[32..].copy_from_slice(sun_view_projection.as_slice());
+        camera_data[32..48].copy_from_slice(sun_view_projection.as_slice());
+        camera_data[48..51].copy_from_slice(camera_position.as_slice());
         context
             .queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&camera_data));
@@ -2014,10 +2109,16 @@ impl PassNode for GeometryPass {
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
             let instances = mesh_instances(context.world, handle as u32);
             let count = instances.len() as u32;
-            let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 20);
-            for (model, emissive) in &instances {
+            let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 24);
+            for (model, emissive, material) in &instances {
                 data.extend_from_slice(model.as_slice());
-                data.extend_from_slice(&[emissive.x, emissive.y, emissive.z, 0.0]);
+                data.extend_from_slice(&[emissive.x, emissive.y, emissive.z, material.roughness]);
+                data.extend_from_slice(&[
+                    material.albedo.x,
+                    material.albedo.y,
+                    material.albedo.z,
+                    material.metallic,
+                ]);
             }
             upload_instances(
                 context.device,
@@ -2481,7 +2582,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     });
     let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 7 => Float32x3];
     let instance_attrs = wgpu::vertex_attr_array![
-        2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4
+        2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 8 => Float32x4
     ];
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
@@ -2497,7 +2598,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
                     attributes: &vertex_attrs,
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: 80,
+                    array_stride: 96,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &instance_attrs,
                 },
@@ -2540,7 +2641,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
                     attributes: &vertex_attrs,
                 },
                 wgpu::VertexBufferLayout {
-                    array_stride: 80,
+                    array_stride: 96,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &instance_attrs,
                 },
@@ -2598,7 +2699,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         mesh_gpu(&device, &queue, &CUBE_VERTICES),
     ];
 
-    let camera_buffer = uniform_buffer(&device, 192);
+    let camera_buffer = uniform_buffer(&device, 208);
     let lights_buffer = uniform_buffer(&device, 320);
     let geometry_bind_group = bind_group(
         &device,
