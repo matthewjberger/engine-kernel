@@ -1573,6 +1573,151 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 ";
 
+const IBL_COMMON: &str = "
+const PI: f32 = 3.14159265;
+fn sky(direction: vec3<f32>) -> vec3<f32> {
+    let d = normalize(direction);
+    let up = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);
+    let horizon = vec3<f32>(0.62, 0.66, 0.74);
+    let zenith = vec3<f32>(0.12, 0.22, 0.46);
+    let ground = vec3<f32>(0.14, 0.12, 0.10);
+    var color = mix(horizon, zenith, smoothstep(0.5, 1.0, up));
+    color = mix(ground, color, smoothstep(0.46, 0.54, up));
+    let sun_direction = normalize(vec3<f32>(0.3, 0.7, 0.4));
+    color += vec3<f32>(1.0, 0.95, 0.85) * pow(max(dot(d, sun_direction), 0.0), 400.0) * 12.0;
+    return color;
+}
+fn cube_direction(face: u32, uv: vec2<f32>) -> vec3<f32> {
+    let s = uv * 2.0 - 1.0;
+    var dir = vec3<f32>(-s.x, -s.y, -1.0);
+    switch face {
+        case 0u { dir = vec3<f32>(1.0, -s.y, -s.x); }
+        case 1u { dir = vec3<f32>(-1.0, -s.y, s.x); }
+        case 2u { dir = vec3<f32>(s.x, 1.0, s.y); }
+        case 3u { dir = vec3<f32>(s.x, -1.0, -s.y); }
+        case 4u { dir = vec3<f32>(s.x, -s.y, 1.0); }
+        default { dir = vec3<f32>(-s.x, -s.y, -1.0); }
+    }
+    return normalize(dir);
+}
+fn radical_inverse(value: u32) -> f32 {
+    var bits = value;
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return f32(bits) * 2.3283064365386963e-10;
+}
+fn hammersley(index: u32, count: u32) -> vec2<f32> {
+    return vec2<f32>(f32(index) / f32(count), radical_inverse(index));
+}
+fn tangent_basis(normal: vec3<f32>) -> mat3x3<f32> {
+    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(normal.z) < 0.999);
+    let tangent = normalize(cross(up, normal));
+    let bitangent = cross(normal, tangent);
+    return mat3x3<f32>(tangent, bitangent, normal);
+}
+fn importance_ggx(xi: vec2<f32>, roughness: f32, normal: vec3<f32>) -> vec3<f32> {
+    let a = roughness * roughness;
+    let phi = 2.0 * PI * xi.x;
+    let cos_theta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    let sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+    let half_local = vec3<f32>(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
+    return tangent_basis(normal) * half_local;
+}
+fn geometry_ibl(n_dot: f32, roughness: f32) -> f32 {
+    let k = roughness * roughness / 2.0;
+    return n_dot / (n_dot * (1.0 - k) + k);
+}
+";
+
+const IRRADIANCE_SHADER: &str = "
+@group(0) @binding(0) var irradiance_output: texture_storage_2d_array<rgba16float, write>;
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(irradiance_output).x;
+    if id.x >= size || id.y >= size {
+        return;
+    }
+    let uv = (vec2<f32>(f32(id.x), f32(id.y)) + 0.5) / f32(size);
+    let normal = cube_direction(id.z, uv);
+    let basis = tangent_basis(normal);
+    var color = vec3<f32>(0.0);
+    let samples = 256u;
+    for (var index = 0u; index < samples; index = index + 1u) {
+        let xi = hammersley(index, samples);
+        let phi = 2.0 * PI * xi.x;
+        let cos_theta = sqrt(1.0 - xi.y);
+        let sin_theta = sqrt(xi.y);
+        let local = vec3<f32>(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
+        color += sky(basis * local);
+    }
+    textureStore(irradiance_output, vec2<i32>(i32(id.x), i32(id.y)), i32(id.z), vec4<f32>(color / f32(samples), 1.0));
+}
+";
+
+const PREFILTER_SHADER: &str = "
+@group(0) @binding(0) var prefilter_output: texture_storage_2d_array<rgba16float, write>;
+@group(0) @binding(1) var<uniform> prefilter_params: vec4<f32>;
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(prefilter_output).x;
+    if id.x >= size || id.y >= size {
+        return;
+    }
+    let uv = (vec2<f32>(f32(id.x), f32(id.y)) + 0.5) / f32(size);
+    let normal = cube_direction(id.z, uv);
+    let roughness = prefilter_params.x;
+    var color = vec3<f32>(0.0);
+    var weight = 0.0;
+    let samples = 128u;
+    for (var index = 0u; index < samples; index = index + 1u) {
+        let half_vector = importance_ggx(hammersley(index, samples), roughness, normal);
+        let light = reflect(-normal, half_vector);
+        let n_dot_l = dot(normal, light);
+        if n_dot_l > 0.0 {
+            color += sky(light) * n_dot_l;
+            weight += n_dot_l;
+        }
+    }
+    textureStore(prefilter_output, vec2<i32>(i32(id.x), i32(id.y)), i32(id.z), vec4<f32>(color / max(weight, 0.001), 1.0));
+}
+";
+
+const BRDF_LUT_SHADER: &str = "
+@group(0) @binding(0) var brdf_output: texture_storage_2d<rgba16float, write>;
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(brdf_output);
+    if id.x >= size.x || id.y >= size.y {
+        return;
+    }
+    let n_dot_v = (f32(id.x) + 0.5) / f32(size.x);
+    let roughness = (f32(id.y) + 0.5) / f32(size.y);
+    let view = vec3<f32>(sqrt(1.0 - n_dot_v * n_dot_v), 0.0, n_dot_v);
+    let normal = vec3<f32>(0.0, 0.0, 1.0);
+    var a = 0.0;
+    var b = 0.0;
+    let samples = 512u;
+    for (var index = 0u; index < samples; index = index + 1u) {
+        let half_vector = importance_ggx(hammersley(index, samples), roughness, normal);
+        let light = reflect(-view, half_vector);
+        let n_dot_l = max(light.z, 0.0);
+        let n_dot_h = max(half_vector.z, 0.0);
+        let v_dot_h = max(dot(view, half_vector), 0.0);
+        if n_dot_l > 0.0 {
+            let g = geometry_ibl(n_dot_l, roughness) * geometry_ibl(n_dot_v, roughness);
+            let g_vis = (g * v_dot_h) / max(n_dot_h * n_dot_v, 0.0001);
+            let fc = pow(1.0 - v_dot_h, 5.0);
+            a += (1.0 - fc) * g_vis;
+            b += fc * g_vis;
+        }
+    }
+    textureStore(brdf_output, vec2<i32>(i32(id.x), i32(id.y)), vec4<f32>(a / f32(samples), b / f32(samples), 0.0, 1.0));
+}
+";
+
 const SHADER: &str = "
 struct Camera {
     view_projection: mat4x4<f32>,
@@ -1627,6 +1772,10 @@ struct LightGrid {
 @group(0) @binding(9) var<storage, read> light_indices: array<u32>;
 @group(0) @binding(10) var albedo_textures: texture_2d_array<f32>;
 @group(0) @binding(11) var albedo_sampler: sampler;
+@group(0) @binding(12) var irradiance_map: texture_cube<f32>;
+@group(0) @binding(13) var prefiltered_map: texture_cube<f32>;
+@group(0) @binding(14) var brdf_lut: texture_2d<f32>;
+@group(0) @binding(15) var ibl_sampler: sampler;
 
 fn get_cluster_index(frag_coord: vec2<f32>, view_depth: f32) -> u32 {
     let tile_x = u32(frag_coord.x / cluster.tile_size.x);
@@ -1873,7 +2022,14 @@ fn lighting(
     frag_coord: vec2<f32>,
 ) -> vec3<f32> {
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
-    var color = lights.ambient.rgb * albedo;
+    let n_dot_v = max(dot(normal, view), 0.0001);
+    let f_roughness = f0 + (max(vec3<f32>(1.0 - roughness), f0) - f0) * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 5.0);
+    let irradiance = textureSampleLevel(irradiance_map, ibl_sampler, normal, 0.0).rgb;
+    let prefiltered = textureSampleLevel(prefiltered_map, ibl_sampler, reflect(-view, normal), roughness * 4.0).rgb;
+    let env_brdf = textureSampleLevel(brdf_lut, ibl_sampler, vec2<f32>(n_dot_v, roughness), 0.0).rg;
+    let diffuse_ibl = irradiance * albedo * (vec3<f32>(1.0) - f_roughness) * (1.0 - metallic);
+    let specular_ibl = prefiltered * (f_roughness * env_brdf.x + env_brdf.y);
+    var color = diffuse_ibl + specular_ibl;
     let sun = lights.sun_direction.xyz;
     let view_depth = -(camera.view * vec4<f32>(world_position, 1.0)).z;
     let sun_shadow = calculate_shadow(world_position, normal, view_depth);
@@ -3256,6 +3412,142 @@ fn albedo_texture_array(
     (view, sampler)
 }
 
+fn ibl_storage_texture(device: &wgpu::Device, size: u32, layers: u32, mips: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: layers,
+        },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+fn generate_ibl(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (
+    wgpu::TextureView,
+    wgpu::TextureView,
+    wgpu::TextureView,
+    wgpu::Sampler,
+) {
+    let irradiance = ibl_storage_texture(device, 32, 6, 1);
+    let prefiltered = ibl_storage_texture(device, 128, 6, 5);
+    let brdf = ibl_storage_texture(device, 256, 1, 1);
+
+    let irradiance_pipeline = compute_pipeline(device, &format!("{IBL_COMMON}{IRRADIANCE_SHADER}"));
+    let prefilter_pipeline = compute_pipeline(device, &format!("{IBL_COMMON}{PREFILTER_SHADER}"));
+    let brdf_pipeline = compute_pipeline(device, &format!("{IBL_COMMON}{BRDF_LUT_SHADER}"));
+
+    let irradiance_storage = irradiance.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let irradiance_bind = bind_group(
+        device,
+        &irradiance_pipeline.get_bind_group_layout(0),
+        vec![(0, wgpu::BindingResource::TextureView(&irradiance_storage))],
+    );
+    let brdf_storage = brdf.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        ..Default::default()
+    });
+    let brdf_bind = bind_group(
+        device,
+        &brdf_pipeline.get_bind_group_layout(0),
+        vec![(0, wgpu::BindingResource::TextureView(&brdf_storage))],
+    );
+
+    let prefilter_views: Vec<wgpu::TextureView> = (0..5)
+        .map(|mip| {
+            prefiltered.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                base_mip_level: mip,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let prefilter_buffers: Vec<wgpu::Buffer> = (0..5)
+        .map(|mip| {
+            let buffer = uniform_buffer(device, 16);
+            queue.write_buffer(
+                &buffer,
+                0,
+                bytemuck::cast_slice(&[mip as f32 / 4.0, 0.0, 0.0, 0.0]),
+            );
+            buffer
+        })
+        .collect();
+    let prefilter_binds: Vec<wgpu::BindGroup> = (0..5)
+        .map(|mip| {
+            bind_group(
+                device,
+                &prefilter_pipeline.get_bind_group_layout(0),
+                vec![
+                    (0, wgpu::BindingResource::TextureView(&prefilter_views[mip])),
+                    (1, prefilter_buffers[mip].as_entire_binding()),
+                ],
+            )
+        })
+        .collect();
+
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&irradiance_pipeline);
+        pass.set_bind_group(0, &irradiance_bind, &[]);
+        pass.dispatch_workgroups(4, 4, 6);
+        pass.set_pipeline(&brdf_pipeline);
+        pass.set_bind_group(0, &brdf_bind, &[]);
+        pass.dispatch_workgroups(32, 32, 1);
+    }
+    for (mip, prefilter_bind) in prefilter_binds.iter().enumerate() {
+        let groups = (128u32 >> mip).div_ceil(8);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&prefilter_pipeline);
+        pass.set_bind_group(0, prefilter_bind, &[]);
+        pass.dispatch_workgroups(groups, groups, 6);
+    }
+    queue.submit([encoder.finish()]);
+
+    let irradiance_view = irradiance.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::Cube),
+        ..Default::default()
+    });
+    let prefiltered_view = prefiltered.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::Cube),
+        ..Default::default()
+    });
+    let brdf_view = brdf.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        ..Default::default()
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..Default::default()
+    });
+    (irradiance_view, prefiltered_view, brdf_view, sampler)
+}
+
 fn bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -3449,6 +3741,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     );
     let cluster_lights_buffer = storage_buffer(&device, 8 * 32);
     let (albedo_array_view, albedo_array_sampler) = albedo_texture_array(&device, &queue);
+    let (irradiance_view, prefiltered_view, brdf_view, ibl_sampler) = generate_ibl(&device, &queue);
     let geometry_bind_group = bind_group(
         &device,
         &pipeline.get_bind_group_layout(0),
@@ -3465,6 +3758,10 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             (9, light_indices_buffer.as_entire_binding()),
             (10, wgpu::BindingResource::TextureView(&albedo_array_view)),
             (11, wgpu::BindingResource::Sampler(&albedo_array_sampler)),
+            (12, wgpu::BindingResource::TextureView(&irradiance_view)),
+            (13, wgpu::BindingResource::TextureView(&prefiltered_view)),
+            (14, wgpu::BindingResource::TextureView(&brdf_view)),
+            (15, wgpu::BindingResource::Sampler(&ibl_sampler)),
         ],
     );
     let cluster_bounds_pipeline = compute_pipeline(&device, CLUSTER_BOUNDS_SHADER);
