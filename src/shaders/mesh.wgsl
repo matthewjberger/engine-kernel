@@ -56,6 +56,20 @@ struct LightGrid {
 @group(0) @binding(13) var prefiltered_map: texture_cube<f32>;
 @group(0) @binding(14) var brdf_lut: texture_2d<f32>;
 @group(0) @binding(15) var ibl_sampler: sampler;
+@group(0) @binding(16) var normal_textures: texture_2d_array<f32>;
+
+fn cotangent_frame(normal: vec3<f32>, position: vec3<f32>, uv: vec2<f32>) -> mat3x3<f32> {
+    let dp1 = dpdx(position);
+    let dp2 = dpdy(position);
+    let duv1 = dpdx(uv);
+    let duv2 = dpdy(uv);
+    let dp2perp = cross(dp2, normal);
+    let dp1perp = cross(normal, dp1);
+    let tangent = dp2perp * duv1.x + dp1perp * duv2.x;
+    let bitangent = dp2perp * duv1.y + dp1perp * duv2.y;
+    let inverse_max = inverseSqrt(max(dot(tangent, tangent), dot(bitangent, bitangent)));
+    return mat3x3<f32>(tangent * inverse_max, bitangent * inverse_max, normal);
+}
 
 fn get_cluster_index(frag_coord: vec2<f32>, view_depth: f32) -> u32 {
     let tile_x = u32(frag_coord.x / cluster.tile_size.x);
@@ -226,7 +240,7 @@ struct VertexInput {
     @location(5) model_3: vec4<f32>,
     @location(6) emissive: vec4<f32>,
     @location(8) albedo_metallic: vec4<f32>,
-    @location(9) base_layer: f32,
+    @location(9) layers: vec2<f32>,
 }
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -239,6 +253,7 @@ struct VertexOutput {
     @location(7) @interpolate(flat) material: vec2<f32>,
     @location(8) @interpolate(flat) base_layer: u32,
     @location(9) uv: vec2<f32>,
+    @location(10) @interpolate(flat) normal_layer: u32,
 }
 struct GeometryOutput {
     @location(0) color: vec4<f32>,
@@ -348,8 +363,9 @@ fn lighting(
         world_normal,
         in.albedo_metallic.rgb,
         vec2<f32>(in.albedo_metallic.w, in.emissive.w),
-        u32(in.base_layer),
+        u32(in.layers.x),
         planar_uv(in.position * model_scale, in.normal),
+        u32(in.layers.y),
     );
 }
 fn planar_uv(local_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
@@ -364,7 +380,9 @@ fn planar_uv(local_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
 }
 @fragment fn fs(in: VertexOutput) -> GeometryOutput {
     let emissive_surface = in.emissive.r + in.emissive.g + in.emissive.b > 0.0;
-    let normal = normalize(in.world_normal);
+    let geometric_normal = normalize(in.world_normal);
+    let tangent_normal = textureSample(normal_textures, albedo_sampler, in.uv, in.normal_layer).xyz * 2.0 - 1.0;
+    let normal = normalize(cotangent_frame(geometric_normal, in.world_position, in.uv) * tangent_normal);
     let view = normalize(camera.camera_position.xyz - in.world_position);
     let texel = textureSample(albedo_textures, albedo_sampler, in.uv, in.base_layer).rgb;
     let albedo = in.color.rgb * in.albedo * texel;
