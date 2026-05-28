@@ -14,6 +14,7 @@ struct Exposure {
 @group(0) @binding(3) var ao_texture: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> params: vec4<f32>;
 @group(0) @binding(5) var<storage, read> exposure: Exposure;
+@group(0) @binding(6) var ssr_texture: texture_2d<f32>;
 fn aces(color: vec3<f32>) -> vec3<f32> {
     let a = 2.51;
     let b = 0.03;
@@ -27,5 +28,9 @@ fn aces(color: vec3<f32>) -> vec3<f32> {
     let bloom = textureSample(bloom_texture, scene_sampler, in.uv).rgb;
     let ao = textureSample(ao_texture, scene_sampler, in.uv).r;
     let exposure_scale = clamp(exp2(-exposure.current_log_luminance), 0.7, 1.6);
-    return vec4<f32>(aces((scene * ao + bloom * params.x) * exposure_scale), 1.0);
+    var lit = scene * ao + bloom * params.x;
+    let ssr_sample = textureSample(ssr_texture, scene_sampler, in.uv);
+    let ssr_confidence = clamp(ssr_sample.a, 0.0, 1.0);
+    lit = mix(lit, ssr_sample.rgb / max(ssr_confidence, 0.001), ssr_confidence);
+    return vec4<f32>(aces(lit * exposure_scale), 1.0);
 }

@@ -418,8 +418,9 @@ fn planar_uv(local_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
     let lit = lighting(albedo, in.world_position, normal, view, metallic, roughness, orm.r, in.position.xy);
     let emissive_color = in.emissive * textureSample(emissive_textures, albedo_sampler, in.uv, in.emissive_layer).rgb;
     let shaded = lit + emissive_color;
+    let reflectivity = max(metallic, pow(1.0 - roughness, 2.0) * 0.6);
     var out: GeometryOutput;
     out.color = vec4<f32>(shaded, 1.0);
-    out.normal = vec4<f32>(normalize(in.view_normal), 1.0);
+    out.normal = vec4<f32>(normalize(in.view_normal), reflectivity);
     return out;
 }

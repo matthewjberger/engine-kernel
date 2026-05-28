@@ -1676,7 +1676,7 @@ impl State for Demo {
             material: Material {
                 albedo: nalgebra_glm::vec3(0.7, 0.7, 0.7),
                 metallic: 0.0,
-                roughness: 0.9,
+                roughness: 0.25,
                 base_layer: 2,
                 normal_layer: 2,
                 orm_layer: 0,
@@ -1778,6 +1778,10 @@ const COMPOSITE_SHADER: &str = include_str!("shaders/composite.wgsl");
 const FXAA_SHADER: &str = include_str!("shaders/fxaa.wgsl");
 
 const AUTO_EXPOSURE_SHADER: &str = include_str!("shaders/auto_exposure.wgsl");
+
+const SSR_SHADER: &str = include_str!("shaders/ssr.wgsl");
+
+const SSR_BLUR_SHADER: &str = include_str!("shaders/ssr_blur.wgsl");
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -3361,6 +3365,40 @@ fn fxaa_update(context: &PassContext, buffer: &wgpu::Buffer) {
     );
 }
 
+fn ssr_update(context: &PassContext, buffer: &wgpu::Buffer) {
+    let projection =
+        camera_projection(context.world, context.aspect_ratio).unwrap_or_else(Mat4::identity);
+    let inverse = projection.try_inverse().unwrap_or_else(Mat4::identity);
+    let (width, height) = context.size;
+    let mut data = [0u32; 40];
+    for (index, value) in projection.as_slice().iter().enumerate() {
+        data[index] = value.to_bits();
+    }
+    for (index, value) in inverse.as_slice().iter().enumerate() {
+        data[16 + index] = value.to_bits();
+    }
+    data[32] = (width as f32).to_bits();
+    data[33] = (height as f32).to_bits();
+    data[34] = 64;
+    data[35] = 30.0f32.to_bits();
+    data[36] = 0.7f32.to_bits();
+    data[37] = 1.0f32.to_bits();
+    data[38] = 0.7f32.to_bits();
+    data[39] = 1.0f32.to_bits();
+    context
+        .queue
+        .write_buffer(buffer, 0, bytemuck::cast_slice(&data));
+}
+
+fn ssr_blur_update(context: &PassContext, buffer: &wgpu::Buffer) {
+    let (width, height) = context.size;
+    context.queue.write_buffer(
+        buffer,
+        0,
+        bytemuck::cast_slice(&[width as f32, height as f32, 0.001, 8.0]),
+    );
+}
+
 impl PassNode for FullscreenPass {
     fn reads(&self) -> Vec<&'static str> {
         self.bindings
@@ -4063,6 +4101,12 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let fxaa_params_buffer = uniform_buffer(&device, 16);
     let auto_exposure_pipeline = compute_pipeline(&device, AUTO_EXPOSURE_SHADER);
     let exposure_buffer = storage_buffer(&device, 32);
+    let ssr_pipeline = fullscreen_pipeline(&device, SSR_SHADER, SCENE_FORMAT);
+    let ssr_bind_group_layout = ssr_pipeline.get_bind_group_layout(0);
+    let ssr_params_buffer = uniform_buffer(&device, 160);
+    let ssr_blur_pipeline = fullscreen_pipeline(&device, SSR_BLUR_SHADER, SCENE_FORMAT);
+    let ssr_blur_bind_group_layout = ssr_blur_pipeline.get_bind_group_layout(0);
+    let ssr_blur_params_buffer = uniform_buffer(&device, 16);
 
     let helmet = fetch_gltf(
         "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb",
@@ -4385,6 +4429,8 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let bright = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let blur_temp = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let bloom = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
+    let ssr_raw = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
+    let ssr = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let ldr = add_color_resource(&mut graph, false, SCENE_FORMAT, background);
     let skin_pipeline = compute_pipeline(&device, SKIN_COMPUTE_SHADER);
     let joint_buffer = storage_buffer(&device, 64);
@@ -4478,6 +4524,56 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     add_pass(
         &mut graph,
         Box::new(FullscreenPass {
+            pipeline: ssr_pipeline,
+            bind_group_layout: ssr_bind_group_layout,
+            output: "ssr_raw",
+            bindings: vec![
+                Binding::Read("depth"),
+                Binding::Read("normals"),
+                Binding::Read("scene"),
+                Binding::Sampler,
+                Binding::Uniform,
+            ],
+            sampler: Some(linear_sampler(&device)),
+            uniform: Some(ssr_params_buffer),
+            storage: None,
+            update: Some(ssr_update),
+        }),
+        &[
+            ("depth", depth),
+            ("normals", normals),
+            ("scene", scene),
+            ("ssr_raw", ssr_raw),
+        ],
+    );
+    add_pass(
+        &mut graph,
+        Box::new(FullscreenPass {
+            pipeline: ssr_blur_pipeline,
+            bind_group_layout: ssr_blur_bind_group_layout,
+            output: "ssr",
+            bindings: vec![
+                Binding::Read("ssr_raw"),
+                Binding::Read("depth"),
+                Binding::Read("normals"),
+                Binding::Sampler,
+                Binding::Uniform,
+            ],
+            sampler: Some(linear_sampler(&device)),
+            uniform: Some(ssr_blur_params_buffer),
+            storage: None,
+            update: Some(ssr_blur_update),
+        }),
+        &[
+            ("ssr_raw", ssr_raw),
+            ("depth", depth),
+            ("normals", normals),
+            ("ssr", ssr),
+        ],
+    );
+    add_pass(
+        &mut graph,
+        Box::new(FullscreenPass {
             pipeline: bright_pipeline,
             bind_group_layout: bright_bind_group_layout,
             output: "bright",
@@ -4530,6 +4626,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
                 Binding::Read("ao"),
                 Binding::Uniform,
                 Binding::Storage,
+                Binding::Read("ssr"),
             ],
             sampler: Some(linear_sampler(&device)),
             uniform: Some(composite_params_buffer),
@@ -4541,6 +4638,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             ("bloom", bloom),
             ("ao", ao),
             ("color", ldr),
+            ("ssr", ssr),
         ],
     );
     add_pass(
