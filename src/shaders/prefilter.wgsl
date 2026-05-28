@@ -17,7 +17,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let light = reflect(-normal, half_vector);
         let n_dot_l = dot(normal, light);
         if n_dot_l > 0.0 {
-            color += sky(light) * n_dot_l;
+            color += environment(light) * n_dot_l;
             weight += n_dot_l;
         }
     }

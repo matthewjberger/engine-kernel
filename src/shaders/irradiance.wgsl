@@ -16,7 +16,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let cos_theta = sqrt(1.0 - xi.y);
         let sin_theta = sqrt(xi.y);
         let local = vec3<f32>(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
-        color += sky(basis * local);
+        color += environment(basis * local);
     }
     textureStore(irradiance_output, vec2<i32>(i32(id.x), i32(id.y)), i32(id.z), vec4<f32>(color / f32(samples), 1.0));
 }

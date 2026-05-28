@@ -2207,6 +2207,70 @@ fn with_uv(vertices: &[f32]) -> Vec<f32> {
     out
 }
 
+#[cfg(target_arch = "wasm32")]
+fn fetch_hdri(_url: &str) -> Option<(Vec<f32>, u32, u32)> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fetch_hdri(url: &str) -> Option<(Vec<f32>, u32, u32)> {
+    use std::io::Read;
+    let cache = std::env::temp_dir().join("engine_codegolfed_hdri.hdr");
+    let bytes = match std::fs::read(&cache) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let mut bytes = Vec::new();
+            ureq::get(url)
+                .call()
+                .ok()?
+                .into_reader()
+                .read_to_end(&mut bytes)
+                .ok()?;
+            let _ = std::fs::write(&cache, &bytes);
+            bytes
+        }
+    };
+    let decoded = image::load_from_memory(&bytes).ok()?.to_rgba32f();
+    let (width, height) = decoded.dimensions();
+    Some((decoded.into_raw(), width, height))
+}
+
+fn equirect_texture(device: &wgpu::Device, queue: &wgpu::Queue, url: &str) -> wgpu::TextureView {
+    let (data, width, height) =
+        fetch_hdri(url).unwrap_or_else(|| (vec![0.4, 0.4, 0.45, 1.0], 1, 1));
+    let extent = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&data),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 16),
+            rows_per_image: Some(height),
+        },
+        extent,
+    );
+    texture.create_view(&Default::default())
+}
+
 fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> MeshGpu {
     let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
@@ -2979,6 +3043,7 @@ fn ibl_storage_texture(device: &wgpu::Device, size: u32, layers: u32, mips: u32)
 fn generate_ibl(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    equirect: &wgpu::TextureView,
 ) -> (
     wgpu::TextureView,
     wgpu::TextureView,
@@ -3000,7 +3065,10 @@ fn generate_ibl(
     let irradiance_bind = bind_group(
         device,
         &irradiance_pipeline.get_bind_group_layout(0),
-        vec![(0, wgpu::BindingResource::TextureView(&irradiance_storage))],
+        vec![
+            (0, wgpu::BindingResource::TextureView(&irradiance_storage)),
+            (2, wgpu::BindingResource::TextureView(equirect)),
+        ],
     );
     let brdf_storage = brdf.create_view(&wgpu::TextureViewDescriptor {
         dimension: Some(wgpu::TextureViewDimension::D2),
@@ -3041,6 +3109,7 @@ fn generate_ibl(
                 vec![
                     (0, wgpu::BindingResource::TextureView(&prefilter_views[mip])),
                     (1, prefilter_buffers[mip].as_entire_binding()),
+                    (2, wgpu::BindingResource::TextureView(equirect)),
                 ],
             )
         })
@@ -3293,7 +3362,13 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         emissive: import.emissive_factor,
         mesh_base: 2,
     });
-    let (irradiance_view, prefiltered_view, brdf_view, ibl_sampler) = generate_ibl(&device, &queue);
+    let equirect_view = equirect_texture(
+        &device,
+        &queue,
+        "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/symmetrical_garden_02_1k.hdr",
+    );
+    let (irradiance_view, prefiltered_view, brdf_view, ibl_sampler) =
+        generate_ibl(&device, &queue, &equirect_view);
     let point_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(POINT_SHADOW_SHADER.into()),

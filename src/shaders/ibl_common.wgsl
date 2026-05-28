@@ -1,15 +1,11 @@
 const PI: f32 = 3.14159265;
-fn sky(direction: vec3<f32>) -> vec3<f32> {
+@group(0) @binding(2) var equirect: texture_2d<f32>;
+fn environment(direction: vec3<f32>) -> vec3<f32> {
     let d = normalize(direction);
-    let up = clamp(d.y * 0.5 + 0.5, 0.0, 1.0);
-    let horizon = vec3<f32>(0.62, 0.66, 0.74);
-    let zenith = vec3<f32>(0.12, 0.22, 0.46);
-    let ground = vec3<f32>(0.14, 0.12, 0.10);
-    var color = mix(horizon, zenith, smoothstep(0.5, 1.0, up));
-    color = mix(ground, color, smoothstep(0.46, 0.54, up));
-    let sun_direction = normalize(vec3<f32>(0.3, 0.7, 0.4));
-    color += vec3<f32>(1.0, 0.95, 0.85) * pow(max(dot(d, sun_direction), 0.0), 400.0) * 12.0;
-    return color;
+    let uv = vec2<f32>(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);
+    let size = vec2<f32>(textureDimensions(equirect));
+    let coord = vec2<i32>(clamp(uv * size, vec2<f32>(0.0), size - 1.0));
+    return textureLoad(equirect, coord, 0).rgb;
 }
 fn cube_direction(face: u32, uv: vec2<f32>) -> vec3<f32> {
     let s = uv * 2.0 - 1.0;
