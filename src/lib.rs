@@ -1939,6 +1939,50 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
     }
 }
 
+impl GeometryPass {
+    fn render_shadow_atlas(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        bind_groups: &[wgpu::BindGroup],
+        count: usize,
+        counts: &[u32],
+    ) {
+        for (slot, bind_group) in bind_groups.iter().take(count).enumerate() {
+            let load = if slot == 0 {
+                wgpu::LoadOp::Clear(0.0)
+            } else {
+                wgpu::LoadOp::Load
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: Some(wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            let slot_x = (slot % 2) as f32 * 1024.0;
+            let slot_y = (slot / 2) as f32 * 1024.0;
+            pass.set_viewport(slot_x, slot_y, 1024.0, 1024.0, 0.0, 1.0);
+            pass.set_scissor_rect(slot_x as u32, slot_y as u32, 1024, 1024);
+            pass.set_pipeline(&self.shadow_pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            for (handle, mesh) in self.meshes.iter().enumerate() {
+                if counts[handle] > 0 {
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
+                    pass.draw(0..mesh.vertex_count, 0..counts[handle]);
+                }
+            }
+        }
+    }
+}
+
 impl PassNode for GeometryPass {
     fn color_writes(&self) -> Vec<&'static str> {
         vec!["color", "normals"]
@@ -2118,75 +2162,20 @@ impl PassNode for GeometryPass {
             counts.push(count);
         }
 
-        for cascade in 0..4 {
-            let load = if cascade == 0 {
-                wgpu::LoadOp::Clear(0.0)
-            } else {
-                wgpu::LoadOp::Load
-            };
-            let mut shadow_pass = context
-                .encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &[],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.shadow_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    ..Default::default()
-                });
-            let slot_x = (cascade % 2) as f32 * 1024.0;
-            let slot_y = (cascade / 2) as f32 * 1024.0;
-            shadow_pass.set_viewport(slot_x, slot_y, 1024.0, 1024.0, 0.0, 1.0);
-            shadow_pass.set_scissor_rect(slot_x as u32, slot_y as u32, 1024, 1024);
-            shadow_pass.set_pipeline(&self.shadow_pipeline);
-            shadow_pass.set_bind_group(0, &self.cascade_bind_groups[cascade], &[]);
-            for (handle, mesh) in self.meshes.iter().enumerate() {
-                if counts[handle] > 0 {
-                    shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    shadow_pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
-                    shadow_pass.draw(0..mesh.vertex_count, 0..counts[handle]);
-                }
-            }
-        }
-
-        for slot in 0..spot_shadows.len() {
-            let load = if slot == 0 {
-                wgpu::LoadOp::Clear(0.0)
-            } else {
-                wgpu::LoadOp::Load
-            };
-            let mut spot_pass = context
-                .encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &[],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.spot_atlas_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    ..Default::default()
-                });
-            let slot_x = (slot % 2) as f32 * 1024.0;
-            let slot_y = (slot / 2) as f32 * 1024.0;
-            spot_pass.set_viewport(slot_x, slot_y, 1024.0, 1024.0, 0.0, 1.0);
-            spot_pass.set_scissor_rect(slot_x as u32, slot_y as u32, 1024, 1024);
-            spot_pass.set_pipeline(&self.shadow_pipeline);
-            spot_pass.set_bind_group(0, &self.spot_bind_groups[slot], &[]);
-            for (handle, mesh) in self.meshes.iter().enumerate() {
-                if counts[handle] > 0 {
-                    spot_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    spot_pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
-                    spot_pass.draw(0..mesh.vertex_count, 0..counts[handle]);
-                }
-            }
-        }
+        self.render_shadow_atlas(
+            context.encoder,
+            &self.shadow_view,
+            &self.cascade_bind_groups,
+            4,
+            &counts,
+        );
+        self.render_shadow_atlas(
+            context.encoder,
+            &self.spot_atlas_view,
+            &self.spot_bind_groups,
+            spot_shadows.len(),
+            &counts,
+        );
 
         let (color_view, color_load, color_store) = color_attachment(context, "color");
         let (normal_view, normal_load, normal_store) = color_attachment(context, "normals");
