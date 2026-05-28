@@ -336,12 +336,18 @@ fn lighting(
 ) -> vec3<f32> {
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
     let n_dot_v = max(dot(normal, view), 0.0001);
-    let f_roughness = f0 + (max(vec3<f32>(1.0 - roughness), f0) - f0) * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 5.0);
-    let irradiance = textureSampleLevel(irradiance_map, ibl_sampler, normal, 0.0).rgb;
-    let prefiltered = textureSampleLevel(prefiltered_map, ibl_sampler, reflect(-view, normal), roughness * 4.0).rgb;
+    let f = f0 + (max(vec3<f32>(1.0 - roughness), f0) - f0) * pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 5.0);
+    let irradiance = clamp(textureSampleLevel(irradiance_map, ibl_sampler, normal, 0.0).rgb, vec3<f32>(0.0), vec3<f32>(65000.0));
+    let prefiltered = clamp(textureSampleLevel(prefiltered_map, ibl_sampler, reflect(-view, normal), roughness * 4.0).rgb, vec3<f32>(0.0), vec3<f32>(65000.0));
     let env_brdf = textureSampleLevel(brdf_lut, ibl_sampler, vec2<f32>(n_dot_v, roughness), 0.0).rg;
-    let diffuse_ibl = irradiance * albedo * (vec3<f32>(1.0) - f_roughness) * (1.0 - metallic);
-    let specular_ibl = prefiltered * (f_roughness * env_brdf.x + env_brdf.y);
+    let fss_ess = f * env_brdf.x + env_brdf.y;
+    let ems = 1.0 - (env_brdf.x + env_brdf.y);
+    let favg = f0 + (vec3<f32>(1.0) - f0) / 21.0;
+    let fms_ems = ems * fss_ess * favg / (vec3<f32>(1.0) - favg * ems);
+    let c_diff = albedo * (1.0 - metallic);
+    let kd_ibl = c_diff * (vec3<f32>(1.0) - fss_ess - fms_ems);
+    let diffuse_ibl = (fms_ems + kd_ibl) * irradiance;
+    let specular_ibl = prefiltered * fss_ess;
     var color = (diffuse_ibl + specular_ibl) * occlusion;
     let sun = lights.sun_direction.xyz;
     let view_depth = -(camera.view * vec4<f32>(world_position, 1.0)).z;
