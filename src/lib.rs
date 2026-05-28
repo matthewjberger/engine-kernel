@@ -2442,6 +2442,43 @@ fn compute_pipeline(device: &wgpu::Device, source: &str) -> wgpu::ComputePipelin
     })
 }
 
+fn render_pipeline(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    buffers: &[wgpu::VertexBufferLayout],
+    targets: &[Option<wgpu::ColorTargetState>],
+    depth_write: bool,
+    depth_compare: wgpu::CompareFunction,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: None,
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers,
+        },
+        fragment: (!targets.is_empty()).then(|| wgpu::FragmentState {
+            module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets,
+        }),
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(depth_write),
+            depth_compare: Some(depth_compare),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn albedo_texture_array(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2723,82 +2760,39 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let instance_attrs = wgpu::vertex_attr_array![
         2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 8 => Float32x4, 9 => Float32
     ];
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None,
-        layout: None,
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs"),
-            compilation_options: Default::default(),
-            buffers: &[
-                wgpu::VertexBufferLayout {
-                    array_stride: 36,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &vertex_attrs,
-                },
-                wgpu::VertexBufferLayout {
-                    array_stride: 100,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &instance_attrs,
-                },
-            ],
+    let mesh_buffers = [
+        wgpu::VertexBufferLayout {
+            array_stride: 36,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &vertex_attrs,
         },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs"),
-            compilation_options: Default::default(),
-            targets: &[Some(SCENE_FORMAT.into()), Some(SCENE_FORMAT.into())],
-        }),
-        primitive: Default::default(),
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Greater),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
-        multisample: Default::default(),
-        multiview_mask: None,
-        cache: None,
-    });
+        wgpu::VertexBufferLayout {
+            array_stride: 100,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &instance_attrs,
+        },
+    ];
+    let pipeline = render_pipeline(
+        &device,
+        &shader,
+        &mesh_buffers,
+        &[Some(SCENE_FORMAT.into()), Some(SCENE_FORMAT.into())],
+        true,
+        wgpu::CompareFunction::Greater,
+    );
 
     let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(SHADOW_SHADER.into()),
     });
-    let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None,
-        layout: None,
-        vertex: wgpu::VertexState {
-            module: &shadow_shader,
-            entry_point: Some("vs"),
-            compilation_options: Default::default(),
-            buffers: &[
-                wgpu::VertexBufferLayout {
-                    array_stride: 36,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &vertex_attrs,
-                },
-                wgpu::VertexBufferLayout {
-                    array_stride: 100,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &instance_attrs,
-                },
-            ],
-        },
-        fragment: None,
-        primitive: Default::default(),
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
-        multisample: Default::default(),
-        multiview_mask: None,
-        cache: None,
-    });
+    let shadow_pipeline = render_pipeline(
+        &device,
+        &shadow_shader,
+        &mesh_buffers,
+        &[],
+        true,
+        wgpu::CompareFunction::GreaterEqual,
+    );
     let shadow_view = shadow_atlas_view(&device);
     let spot_atlas_view = shadow_atlas_view(&device);
     let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2864,33 +2858,14 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         label: None,
         source: wgpu::ShaderSource::Wgsl(SKY_SHADER.into()),
     });
-    let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None,
-        layout: None,
-        vertex: wgpu::VertexState {
-            module: &sky_shader,
-            entry_point: Some("vs"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &sky_shader,
-            entry_point: Some("fs"),
-            compilation_options: Default::default(),
-            targets: &[Some(SCENE_FORMAT.into()), Some(SCENE_FORMAT.into())],
-        }),
-        primitive: Default::default(),
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
-            depth_write_enabled: Some(false),
-            depth_compare: Some(wgpu::CompareFunction::Always),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
-        multisample: Default::default(),
-        multiview_mask: None,
-        cache: None,
-    });
+    let sky_pipeline = render_pipeline(
+        &device,
+        &sky_shader,
+        &[],
+        &[Some(SCENE_FORMAT.into()), Some(SCENE_FORMAT.into())],
+        false,
+        wgpu::CompareFunction::Always,
+    );
     let sky_bind_group = bind_group(
         &device,
         &sky_pipeline.get_bind_group_layout(0),
