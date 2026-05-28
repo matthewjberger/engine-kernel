@@ -12,7 +12,7 @@ fn hammersley(index: u32, count: u32) -> vec2<f32> {
     return vec2<f32>(f32(index) / f32(count), radical_inverse(index));
 }
 fn tangent_basis(normal: vec3<f32>) -> mat3x3<f32> {
-    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(normal.z) < 0.999);
+    let up = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(normal.z) < 0.999);
     let tangent = normalize(cross(up, normal));
     let bitangent = cross(normal, tangent);
     return mat3x3<f32>(tangent, bitangent, normal);
