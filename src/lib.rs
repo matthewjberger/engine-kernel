@@ -1375,12 +1375,33 @@ impl State for Demo {
         world.resources.commands.push(SpawnCommand {
             mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | EMISSIVE,
             transform: LocalTransform {
-                scale: nalgebra_glm::vec3(0.8, 0.8, 0.8),
+                translation: nalgebra_glm::vec3(0.0, 3.0, 0.0),
+                scale: nalgebra_glm::vec3(0.4, 0.4, 0.4),
                 ..Default::default()
             },
             render_mesh: 1,
             emissive: nalgebra_glm::vec3(4.0, 2.2, 0.8),
             material: Material::default(),
+        });
+
+        world.resources.commands.push(SpawnCommand {
+            mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | MATERIAL,
+            transform: LocalTransform {
+                translation: nalgebra_glm::vec3(0.0, 0.6, 0.0),
+                scale: nalgebra_glm::vec3(1.2, 1.2, 1.2),
+                ..Default::default()
+            },
+            render_mesh: 2,
+            emissive: Vec3::zeros(),
+            material: Material {
+                albedo: nalgebra_glm::vec3(0.72, 0.72, 0.74),
+                metallic: 0.1,
+                roughness: 0.5,
+                base_layer: 0,
+                normal_layer: 0,
+                orm_layer: 0,
+                emissive_layer: 0,
+            },
         });
 
         world.resources.commands.push(SpawnCommand {
@@ -1962,6 +1983,70 @@ fn upload_instances(
     if count > 0 {
         queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fetch_gltf(_url: &str) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fetch_gltf(url: &str) -> Option<Vec<f32>> {
+    use std::io::Read;
+    let cache = std::env::temp_dir().join("engine_codegolfed_gltf.glb");
+    let bytes = match std::fs::read(&cache) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let mut bytes = Vec::new();
+            ureq::get(url)
+                .call()
+                .ok()?
+                .into_reader()
+                .read_to_end(&mut bytes)
+                .ok()?;
+            let _ = std::fs::write(&cache, &bytes);
+            bytes
+        }
+    };
+    let (document, buffers, _images) = gltf::import_slice(&bytes).ok()?;
+    let mut vertices = Vec::new();
+    for mesh in document.meshes() {
+        for primitive in mesh.primitives() {
+            let reader =
+                primitive.reader(|buffer| buffers.get(buffer.index()).map(|data| &data.0[..]));
+            let positions: Vec<[f32; 3]> = match reader.read_positions() {
+                Some(iter) => iter.collect(),
+                None => continue,
+            };
+            let normals: Vec<[f32; 3]> = reader
+                .read_normals()
+                .map(|iter| iter.collect())
+                .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
+            let indices: Vec<u32> = reader
+                .read_indices()
+                .map(|iter| iter.into_u32().collect())
+                .unwrap_or_else(|| (0..positions.len() as u32).collect());
+            for &index in &indices {
+                let position = positions[index as usize];
+                let normal = normals
+                    .get(index as usize)
+                    .copied()
+                    .unwrap_or([0.0, 1.0, 0.0]);
+                vertices.extend_from_slice(&[
+                    position[0],
+                    position[1],
+                    position[2],
+                    1.0,
+                    1.0,
+                    1.0,
+                    normal[0],
+                    normal[1],
+                    normal[2],
+                ]);
+            }
+        }
+    }
+    (!vertices.is_empty()).then_some(vertices)
 }
 
 fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> MeshGpu {
@@ -2951,10 +3036,15 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let composite_bind_group_layout = composite_pipeline.get_bind_group_layout(0);
     let composite_params_buffer = uniform_buffer(&device, 16);
 
-    let meshes = vec![
+    let mut meshes = vec![
         mesh_gpu(&device, &queue, &TRIANGLE_VERTICES),
         mesh_gpu(&device, &queue, &CUBE_VERTICES),
     ];
+    if let Some(helmet) = fetch_gltf(
+        "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb",
+    ) {
+        meshes.push(mesh_gpu(&device, &queue, &helmet));
+    }
 
     let camera_buffer = uniform_buffer(&device, 208);
     let lights_buffer = uniform_buffer(&device, 576);
