@@ -5,7 +5,8 @@ struct Camera {
     inverse_projection: mat4x4<f32>,
 }
 @group(0) @binding(0) var<uniform> camera: Camera;
-@group(0) @binding(1) var equirect: texture_2d<f32>;
+@group(0) @binding(1) var environment: texture_cube<f32>;
+@group(0) @binding(2) var environment_sampler: sampler;
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) world_direction: vec3<f32>,
@@ -24,12 +25,9 @@ struct SkyOutput {
     @location(1) normal: vec4<f32>,
 }
 @fragment fn fs(in: VertexOutput) -> SkyOutput {
-    let d = normalize(in.world_direction);
-    let uv = vec2<f32>(atan2(d.z, d.x) * 0.15915494 + 0.5, acos(clamp(d.y, -1.0, 1.0)) * 0.31830989);
-    let size = vec2<f32>(textureDimensions(equirect));
-    let coord = vec2<i32>(clamp(uv * size, vec2<f32>(0.0), size - 1.0));
+    let color = textureSampleLevel(environment, environment_sampler, normalize(in.world_direction), 0.0).rgb;
     var out: SkyOutput;
-    out.color = vec4<f32>(textureLoad(equirect, coord, 0).rgb, 1.0);
+    out.color = vec4<f32>(color, 1.0);
     out.normal = vec4<f32>(0.0, 0.0, 1.0, 1.0);
     return out;
 }

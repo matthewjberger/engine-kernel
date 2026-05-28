@@ -30,6 +30,7 @@ pollster = "0.4.0"
 gltf = "1.4"
 ureq = "2"
 image = { version = "0.25", features = ["hdr"] }
+half = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1.7"

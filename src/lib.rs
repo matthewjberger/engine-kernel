@@ -1443,9 +1443,11 @@ const CLUSTER_ASSIGN_SHADER: &str = include_str!("shaders/cluster_assign.wgsl");
 
 const IBL_COMMON: &str = include_str!("shaders/ibl_common.wgsl");
 
-const IRRADIANCE_SHADER: &str = include_str!("shaders/irradiance.wgsl");
+const EQUIRECT_TO_CUBE_SHADER: &str = include_str!("shaders/equirect_to_cube.wgsl");
 
-const PREFILTER_SHADER: &str = include_str!("shaders/prefilter.wgsl");
+const CUBEMAP_MIPGEN_SHADER: &str = include_str!("shaders/cubemap_mipgen.wgsl");
+
+const FILTER_ENVMAP_SHADER: &str = include_str!("shaders/filter_envmap.wgsl");
 
 const BRDF_LUT_SHADER: &str = include_str!("shaders/brdf_lut.wgsl");
 
@@ -2238,6 +2240,10 @@ fn fetch_hdri(url: &str) -> Option<(Vec<f32>, u32, u32)> {
 fn equirect_texture(device: &wgpu::Device, queue: &wgpu::Queue, url: &str) -> wgpu::TextureView {
     let (data, width, height) =
         fetch_hdri(url).unwrap_or_else(|| (vec![0.4, 0.4, 0.45, 1.0], 1, 1));
+    let half_data: Vec<u16> = data
+        .iter()
+        .map(|&value| half::f16::from_f32(value).to_bits())
+        .collect();
     let extent = wgpu::Extent3d {
         width,
         height,
@@ -2249,7 +2255,7 @@ fn equirect_texture(device: &wgpu::Device, queue: &wgpu::Queue, url: &str) -> wg
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
+        format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -2260,10 +2266,10 @@ fn equirect_texture(device: &wgpu::Device, queue: &wgpu::Queue, url: &str) -> wg
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        bytemuck::cast_slice(&data),
+        bytemuck::cast_slice(&half_data),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(width * 16),
+            bytes_per_row: Some(width * 8),
             rows_per_image: Some(height),
         },
         extent,
@@ -3040,6 +3046,61 @@ fn ibl_storage_texture(device: &wgpu::Device, size: u32, layers: u32, mips: u32)
     })
 }
 
+fn filter_params(
+    output_size: u32,
+    roughness: f32,
+    samples: u32,
+    distribution: u32,
+    mips: u32,
+) -> [u32; 8] {
+    [
+        0,
+        output_size,
+        roughness.to_bits(),
+        samples,
+        1024,
+        1024,
+        distribution,
+        mips,
+    ]
+}
+
+fn array_mip_view(texture: &wgpu::Texture, mip: u32) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        base_mip_level: mip,
+        mip_level_count: Some(1),
+        ..Default::default()
+    })
+}
+
+fn cube_view(texture: &wgpu::Texture) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::Cube),
+        ..Default::default()
+    })
+}
+
+fn dispatch_compute(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &wgpu::ComputePipeline,
+    bind: &wgpu::BindGroup,
+    groups: (u32, u32, u32),
+) {
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind, &[]);
+        pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+    }
+    queue.submit([encoder.finish()]);
+}
+
 fn generate_ibl(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -3048,108 +3109,25 @@ fn generate_ibl(
     wgpu::TextureView,
     wgpu::TextureView,
     wgpu::TextureView,
+    wgpu::TextureView,
     wgpu::Sampler,
 ) {
+    let env_mips = 11u32;
+    let env = ibl_storage_texture(device, 1024, 6, env_mips);
     let irradiance = ibl_storage_texture(device, 64, 6, 1);
     let prefiltered = ibl_storage_texture(device, 512, 6, 5);
     let brdf = ibl_storage_texture(device, 256, 1, 1);
 
-    let irradiance_pipeline = compute_pipeline(device, &format!("{IBL_COMMON}{IRRADIANCE_SHADER}"));
-    let prefilter_pipeline = compute_pipeline(device, &format!("{IBL_COMMON}{PREFILTER_SHADER}"));
+    let equirect_pipeline = compute_pipeline(device, EQUIRECT_TO_CUBE_SHADER);
+    let mipgen_pipeline = compute_pipeline(device, CUBEMAP_MIPGEN_SHADER);
+    let filter_pipeline = compute_pipeline(device, FILTER_ENVMAP_SHADER);
     let brdf_pipeline = compute_pipeline(device, &format!("{IBL_COMMON}{BRDF_LUT_SHADER}"));
 
-    let irradiance_storage = irradiance.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
-        ..Default::default()
-    });
-    let irradiance_bind = bind_group(
-        device,
-        &irradiance_pipeline.get_bind_group_layout(0),
-        vec![
-            (0, wgpu::BindingResource::TextureView(&irradiance_storage)),
-            (2, wgpu::BindingResource::TextureView(equirect)),
-        ],
-    );
-    let brdf_storage = brdf.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::D2),
-        ..Default::default()
-    });
-    let brdf_bind = bind_group(
-        device,
-        &brdf_pipeline.get_bind_group_layout(0),
-        vec![(0, wgpu::BindingResource::TextureView(&brdf_storage))],
-    );
-
-    let prefilter_views: Vec<wgpu::TextureView> = (0..5)
-        .map(|mip| {
-            prefiltered.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                base_mip_level: mip,
-                mip_level_count: Some(1),
-                ..Default::default()
-            })
-        })
-        .collect();
-    let prefilter_buffers: Vec<wgpu::Buffer> = (0..5)
-        .map(|mip| {
-            let buffer = uniform_buffer(device, 16);
-            queue.write_buffer(
-                &buffer,
-                0,
-                bytemuck::cast_slice(&[mip as f32 / 4.0, 0.0, 0.0, 0.0]),
-            );
-            buffer
-        })
-        .collect();
-    let prefilter_binds: Vec<wgpu::BindGroup> = (0..5)
-        .map(|mip| {
-            bind_group(
-                device,
-                &prefilter_pipeline.get_bind_group_layout(0),
-                vec![
-                    (0, wgpu::BindingResource::TextureView(&prefilter_views[mip])),
-                    (1, prefilter_buffers[mip].as_entire_binding()),
-                    (2, wgpu::BindingResource::TextureView(equirect)),
-                ],
-            )
-        })
-        .collect();
-
-    let mut encoder = device.create_command_encoder(&Default::default());
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&irradiance_pipeline);
-        pass.set_bind_group(0, &irradiance_bind, &[]);
-        pass.dispatch_workgroups(8, 8, 6);
-        pass.set_pipeline(&brdf_pipeline);
-        pass.set_bind_group(0, &brdf_bind, &[]);
-        pass.dispatch_workgroups(32, 32, 1);
-    }
-    for (mip, prefilter_bind) in prefilter_binds.iter().enumerate() {
-        let groups = (512u32 >> mip).div_ceil(8);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&prefilter_pipeline);
-        pass.set_bind_group(0, prefilter_bind, &[]);
-        pass.dispatch_workgroups(groups, groups, 6);
-    }
-    queue.submit([encoder.finish()]);
-
-    let irradiance_view = irradiance.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::Cube),
-        ..Default::default()
-    });
-    let prefiltered_view = prefiltered.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::Cube),
-        ..Default::default()
-    });
-    let brdf_view = brdf.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::D2),
+    let equirect_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -3161,7 +3139,121 @@ fn generate_ibl(
         mipmap_filter: wgpu::MipmapFilterMode::Linear,
         ..Default::default()
     });
-    (irradiance_view, prefiltered_view, brdf_view, sampler)
+
+    let env_storage = array_mip_view(&env, 0);
+    let equirect_bind = bind_group(
+        device,
+        &equirect_pipeline.get_bind_group_layout(0),
+        vec![
+            (0, wgpu::BindingResource::TextureView(equirect)),
+            (1, wgpu::BindingResource::Sampler(&equirect_sampler)),
+            (2, wgpu::BindingResource::TextureView(&env_storage)),
+        ],
+    );
+    dispatch_compute(
+        device,
+        queue,
+        &equirect_pipeline,
+        &equirect_bind,
+        (64, 64, 6),
+    );
+
+    for mip in 1..env_mips {
+        let size = 1024u32 >> mip;
+        let source = array_mip_view(&env, mip - 1);
+        let destination = array_mip_view(&env, mip);
+        let params = uniform_buffer(device, 16);
+        queue.write_buffer(&params, 0, bytemuck::cast_slice(&[size, 0u32, 0, 0]));
+        let bind = bind_group(
+            device,
+            &mipgen_pipeline.get_bind_group_layout(0),
+            vec![
+                (0, wgpu::BindingResource::TextureView(&source)),
+                (1, wgpu::BindingResource::Sampler(&sampler)),
+                (2, wgpu::BindingResource::TextureView(&destination)),
+                (3, params.as_entire_binding()),
+            ],
+        );
+        dispatch_compute(
+            device,
+            queue,
+            &mipgen_pipeline,
+            &bind,
+            (size.div_ceil(16), size.div_ceil(16), 6),
+        );
+    }
+
+    let env_cube = cube_view(&env);
+
+    let irradiance_storage = array_mip_view(&irradiance, 0);
+    let irradiance_params = uniform_buffer(device, 32);
+    queue.write_buffer(
+        &irradiance_params,
+        0,
+        bytemuck::cast_slice(&filter_params(64, 1.0, 1024, 0, env_mips)),
+    );
+    let irradiance_bind = bind_group(
+        device,
+        &filter_pipeline.get_bind_group_layout(0),
+        vec![
+            (0, wgpu::BindingResource::TextureView(&env_cube)),
+            (1, wgpu::BindingResource::Sampler(&sampler)),
+            (2, wgpu::BindingResource::TextureView(&irradiance_storage)),
+            (3, irradiance_params.as_entire_binding()),
+        ],
+    );
+    dispatch_compute(device, queue, &filter_pipeline, &irradiance_bind, (4, 4, 6));
+
+    for mip in 0..5u32 {
+        let size = 512u32 >> mip;
+        let storage = array_mip_view(&prefiltered, mip);
+        let params = uniform_buffer(device, 32);
+        queue.write_buffer(
+            &params,
+            0,
+            bytemuck::cast_slice(&filter_params(size, mip as f32 / 4.0, 512, 1, env_mips)),
+        );
+        let bind = bind_group(
+            device,
+            &filter_pipeline.get_bind_group_layout(0),
+            vec![
+                (0, wgpu::BindingResource::TextureView(&env_cube)),
+                (1, wgpu::BindingResource::Sampler(&sampler)),
+                (2, wgpu::BindingResource::TextureView(&storage)),
+                (3, params.as_entire_binding()),
+            ],
+        );
+        dispatch_compute(
+            device,
+            queue,
+            &filter_pipeline,
+            &bind,
+            (size.div_ceil(16), size.div_ceil(16), 6),
+        );
+    }
+
+    let brdf_storage = brdf.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        ..Default::default()
+    });
+    let brdf_bind = bind_group(
+        device,
+        &brdf_pipeline.get_bind_group_layout(0),
+        vec![(0, wgpu::BindingResource::TextureView(&brdf_storage))],
+    );
+    dispatch_compute(device, queue, &brdf_pipeline, &brdf_bind, (32, 32, 1));
+
+    let brdf_view = brdf.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        ..Default::default()
+    });
+    (
+        env_cube,
+        cube_view(&irradiance),
+        cube_view(&prefiltered),
+        brdf_view,
+        sampler,
+    )
 }
 
 fn bind_group(
@@ -3367,7 +3459,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         &queue,
         "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/symmetrical_garden_02_1k.hdr",
     );
-    let (irradiance_view, prefiltered_view, brdf_view, ibl_sampler) =
+    let (env_cube_view, irradiance_view, prefiltered_view, brdf_view, ibl_sampler) =
         generate_ibl(&device, &queue, &equirect_view);
     let point_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
@@ -3477,7 +3569,8 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         &sky_pipeline.get_bind_group_layout(0),
         vec![
             (0, camera_buffer.as_entire_binding()),
-            (1, wgpu::BindingResource::TextureView(&equirect_view)),
+            (1, wgpu::BindingResource::TextureView(&env_cube_view)),
+            (2, wgpu::BindingResource::Sampler(&ibl_sampler)),
         ],
     );
     let cluster_bounds_pipeline = compute_pipeline(&device, CLUSTER_BOUNDS_SHADER);
