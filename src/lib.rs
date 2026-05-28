@@ -80,6 +80,14 @@ struct RenderMesh(u32);
 #[derive(Clone, Copy, Default)]
 struct Emissive(Vec3);
 
+#[derive(Clone, Copy, Default)]
+struct Light {
+    color: Vec3,
+    intensity: f32,
+    point: bool,
+    range: f32,
+}
+
 #[derive(Clone, Copy)]
 struct PerspectiveCamera {
     y_fov_radians: f32,
@@ -244,6 +252,7 @@ components!(
     PAN_ORBIT_CAMERA      => PanOrbitCamera,      pan_orbit_cameras;
     RENDER_MESH           => RenderMesh,          render_meshes;
     EMISSIVE              => Emissive,            emissives;
+    LIGHT                 => Light,               lights;
 );
 
 type System = fn(&mut World);
@@ -614,6 +623,13 @@ fn get_render_mesh_mut(world: &mut World, entity: Entity) -> Option<&mut RenderM
     })
 }
 
+fn get_light_mut(world: &mut World, entity: Entity) -> Option<&mut Light> {
+    component_mut(world, entity, LIGHT, |table, row, tick| {
+        table.lights[row].1 = tick;
+        &mut table.lights[row].0
+    })
+}
+
 fn collect_entities(world: &mut World, mask: u64) -> Vec<Entity> {
     let mut entities = Vec::new();
     for table in query_tables(world, mask).to_vec() {
@@ -946,6 +962,50 @@ fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3)> {
     instances
 }
 
+fn gather_lights(world: &World) -> [f32; 80] {
+    let mut data = [0.0f32; 80];
+    data[0] = 0.03;
+    data[1] = 0.03;
+    data[2] = 0.04;
+    let mut point_count = 0usize;
+    for table in &world.tables {
+        if table.mask & (LIGHT | GLOBAL_TRANSFORM) != (LIGHT | GLOBAL_TRANSFORM) {
+            continue;
+        }
+        for row in 0..table.entities.len() {
+            let global = table.global_transforms[row].0.0;
+            let light = table.lights[row].0;
+            let color = light.color * light.intensity;
+            if light.point {
+                if point_count < 8 {
+                    let position = transform_translation(&global);
+                    let slot = 16 + point_count * 4;
+                    data[slot] = position.x;
+                    data[slot + 1] = position.y;
+                    data[slot + 2] = position.z;
+                    data[slot + 3] = light.range;
+                    let color_slot = 48 + point_count * 4;
+                    data[color_slot] = color.x;
+                    data[color_slot + 1] = color.y;
+                    data[color_slot + 2] = color.z;
+                    point_count += 1;
+                }
+            } else {
+                let direction = -transform_forward(&global);
+                data[4] = direction.x;
+                data[5] = direction.y;
+                data[6] = direction.z;
+                data[7] = 1.0;
+                data[8] = color.x;
+                data[9] = color.y;
+                data[10] = color.z;
+            }
+        }
+    }
+    data[12] = point_count as f32;
+    data
+}
+
 fn timing_system(world: &mut World) {
     let now = Instant::now();
     world.resources.delta_time = world
@@ -1010,6 +1070,28 @@ impl State for Demo {
         }
         world.resources.active_camera = Some(camera);
         pan_orbit_camera_system(world);
+
+        let sun = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | LIGHT);
+        if let Some(local) = get_local_transform_mut(world, sun) {
+            local.rotation = nalgebra_glm::quat_angle_axis(-1.0, &Vec3::x());
+        }
+        if let Some(light) = get_light_mut(world, sun) {
+            light.color = nalgebra_glm::vec3(1.0, 0.96, 0.9);
+            light.intensity = 2.5;
+        }
+        mark_local_transform_dirty(world, sun);
+
+        let lamp = spawn(world, LOCAL_TRANSFORM | GLOBAL_TRANSFORM | LIGHT);
+        if let Some(local) = get_local_transform_mut(world, lamp) {
+            local.translation = nalgebra_glm::vec3(0.0, 0.5, 0.0);
+        }
+        if let Some(light) = get_light_mut(world, lamp) {
+            light.color = nalgebra_glm::vec3(1.0, 0.55, 0.2);
+            light.intensity = 4.0;
+            light.point = true;
+            light.range = 7.0;
+        }
+        mark_local_transform_dirty(world, lamp);
 
         let count = 12;
         for index in 0..count {
@@ -1081,7 +1163,16 @@ struct Camera {
     view_projection: mat4x4<f32>,
     view: mat4x4<f32>,
 }
+struct Lights {
+    ambient: vec4<f32>,
+    sun_direction: vec4<f32>,
+    sun_color: vec4<f32>,
+    point_count: vec4<f32>,
+    point_position: array<vec4<f32>, 8>,
+    point_color: array<vec4<f32>, 8>,
+}
 @group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var<uniform> lights: Lights;
 @group(1) @binding(0) var<storage, read> tints: array<vec4<f32>, 64>;
 
 struct VertexInput {
@@ -1100,21 +1191,51 @@ struct VertexOutput {
     @location(1) @interpolate(flat) instance: u32,
     @location(2) @interpolate(flat) emissive: vec3<f32>,
     @location(3) view_normal: vec3<f32>,
+    @location(4) world_position: vec3<f32>,
+    @location(5) world_normal: vec3<f32>,
 }
 struct GeometryOutput {
     @location(0) color: vec4<f32>,
     @location(1) normal: vec4<f32>,
 }
+fn lighting(albedo: vec3<f32>, world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    var radiance = lights.ambient.rgb;
+    radiance += lights.sun_color.rgb * max(dot(normal, lights.sun_direction.xyz), 0.0);
+    let count = u32(lights.point_count.x);
+    for (var index = 0u; index < count; index = index + 1u) {
+        let to_light = lights.point_position[index].xyz - world_position;
+        let distance = max(length(to_light), 0.0001);
+        let range = max(lights.point_position[index].w, 0.0001);
+        let attenuation = clamp(1.0 - distance / range, 0.0, 1.0);
+        radiance += lights.point_color[index].rgb
+            * max(dot(normal, to_light / distance), 0.0)
+            * attenuation
+            * attenuation;
+    }
+    return albedo * radiance;
+}
 @vertex fn vs(in: VertexInput, @builtin(instance_index) instance_index: u32) -> VertexOutput {
     let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
-    let clip = camera.view_projection * model * vec4<f32>(in.position, 1.0);
-    let view_normal = (camera.view * model * vec4<f32>(in.normal, 0.0)).xyz;
-    return VertexOutput(clip, vec4<f32>(in.color, 1.0), instance_index, in.emissive.rgb, view_normal);
+    let world = model * vec4<f32>(in.position, 1.0);
+    let clip = camera.view_projection * world;
+    let world_normal = (model * vec4<f32>(in.normal, 0.0)).xyz;
+    let view_normal = (camera.view * vec4<f32>(world_normal, 0.0)).xyz;
+    return VertexOutput(
+        clip,
+        vec4<f32>(in.color, 1.0),
+        instance_index,
+        in.emissive.rgb,
+        view_normal,
+        world.xyz,
+        world_normal,
+    );
 }
 @fragment fn fs(in: VertexOutput) -> GeometryOutput {
     let tint = tints[in.instance % 64u].rgb;
     let emissive_surface = in.emissive.r + in.emissive.g + in.emissive.b > 0.0;
-    let shaded = select(in.color.rgb * tint, in.color.rgb * in.emissive, emissive_surface);
+    let normal = normalize(in.world_normal);
+    let lit = lighting(in.color.rgb * tint, in.world_position, normal);
+    let shaded = select(lit, in.color.rgb * in.emissive, emissive_surface);
     var out: GeometryOutput;
     out.color = vec4<f32>(shaded, 1.0);
     out.normal = vec4<f32>(normalize(in.view_normal), 1.0);
@@ -1753,6 +1874,7 @@ struct GeometryPass {
     pipeline: wgpu::RenderPipeline,
     meshes: Vec<MeshGpu>,
     camera_buffer: wgpu::Buffer,
+    lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     tint_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -1824,6 +1946,11 @@ impl PassNode for GeometryPass {
         context
             .queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&camera_data));
+
+        let lights = gather_lights(context.world);
+        context
+            .queue
+            .write_buffer(&self.lights_buffer, 0, bytemuck::cast_slice(&lights));
 
         let mut counts = Vec::with_capacity(self.meshes.len());
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
@@ -2368,13 +2495,25 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 320,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &pipeline.get_bind_group_layout(0),
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: camera_buffer.as_entire_binding(),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: lights_buffer.as_entire_binding(),
+            },
+        ],
     });
     let tint_bind_group_layout = pipeline.get_bind_group_layout(1);
 
@@ -2461,6 +2600,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             pipeline,
             meshes,
             camera_buffer,
+            lights_buffer,
             bind_group,
             tint_bind_group_layout,
         }),
