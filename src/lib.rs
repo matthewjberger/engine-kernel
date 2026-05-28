@@ -1287,6 +1287,13 @@ fn geometry_schlick(n_dot: f32, roughness: f32) -> f32 {
 fn fresnel(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
+fn range_attenuation(range: f32, distance: f32) -> f32 {
+    if range <= 0.0 {
+        return 1.0;
+    }
+    let clamped = max(distance, 0.01);
+    return max(min(1.0 - pow(distance / range, 4.0), 1.0), 0.0) / (clamped * clamped);
+}
 fn brdf(
     normal: vec3<f32>,
     view: vec3<f32>,
@@ -1325,9 +1332,8 @@ fn lighting(
     for (var index = 0u; index < count; index = index + 1u) {
         let to_light = lights.point_position[index].xyz - world_position;
         let distance = max(length(to_light), 0.0001);
-        let range = max(lights.point_position[index].w, 0.0001);
-        let attenuation = clamp(1.0 - distance / range, 0.0, 1.0);
-        let radiance = lights.point_color[index].rgb * attenuation * attenuation;
+        let attenuation = range_attenuation(lights.point_position[index].w, distance);
+        let radiance = lights.point_color[index].rgb * attenuation;
         color += brdf(normal, view, to_light / distance, radiance, albedo, metallic, roughness, f0);
     }
     return color;
