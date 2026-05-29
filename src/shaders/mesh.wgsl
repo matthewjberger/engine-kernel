@@ -235,7 +235,7 @@ fn calculate_shadow(world_position: vec3<f32>, world_normal: vec3<f32>, view_dep
     return factor;
 }
 
-fn spot_shadow_factor(world_position: vec3<f32>, shadow_index: i32) -> f32 {
+fn spot_shadow_factor(world_position: vec3<f32>, shadow_index: i32, normal: vec3<f32>, light_position: vec3<f32>) -> f32 {
     if shadow_index < 0 {
         return 1.0;
     }
@@ -247,7 +247,9 @@ fn spot_shadow_factor(world_position: vec3<f32>, shadow_index: i32) -> f32 {
     let rect = spot_shadow.atlas_rect[shadow_index];
     let scale = rect.z;
     let uv = (ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5)) * scale + rect.xy;
-    let depth = ndc.z + rect.w;
+    let light_direction = normalize(light_position - world_position);
+    let slope = 1.0 - abs(dot(normal, light_direction));
+    let depth = ndc.z + rect.w * (1.0 + slope * 2.0);
     let slot_min = rect.xy;
     let slot_max = rect.xy + scale;
     let in_bounds = uv.x >= slot_min.x && uv.x <= slot_max.x && uv.y >= slot_min.y && uv.y <= slot_max.y && ndc.z >= 0.0 && ndc.z <= 1.0;
@@ -410,7 +412,7 @@ fn lighting(
                 lights.point_color[index].w,
             );
         }
-        let spot_visibility = spot_shadow_factor(world_position, i32(lights.point_shadow[index].x));
+        let spot_visibility = spot_shadow_factor(world_position, i32(lights.point_shadow[index].x), normal, lights.point_position[index].xyz);
         let point_visibility = point_shadow_factor(index, world_position, normal);
         let radiance =
             lights.point_color[index].rgb * attenuation * spot * spot_visibility * point_visibility;
