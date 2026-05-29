@@ -2231,6 +2231,7 @@ struct MeshGpu {
     bounds_buffer: wgpu::Buffer,
     cull_buffer: wgpu::Buffer,
     objects_bind_group: Option<wgpu::BindGroup>,
+    cached_instances: Vec<f32>,
 }
 
 struct GeometryPass {
@@ -2291,6 +2292,73 @@ fn upload_instances(
     if count > 0 {
         queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
     }
+}
+
+fn upload_instances_diff(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &mut wgpu::Buffer,
+    capacity: &mut u32,
+    cached: &mut Vec<f32>,
+    data: &[f32],
+    count: u32,
+) {
+    if count > *capacity {
+        *capacity = count.next_power_of_two();
+        *buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: *capacity as u64 * 112,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        cached.clear();
+    }
+    if count == 0 {
+        cached.clear();
+        return;
+    }
+    if cached.len() != data.len() {
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+        cached.clear();
+        cached.extend_from_slice(data);
+        return;
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut changed = 0usize;
+    let mut open: Option<(usize, usize)> = None;
+    for (record, (new, old)) in data
+        .chunks_exact(28)
+        .zip(cached.chunks_exact(28))
+        .enumerate()
+    {
+        if new != old {
+            changed += 1;
+            open = Some(open.map_or((record, record + 1), |(start, _)| (start, record + 1)));
+        } else if let Some(range) = open.take() {
+            ranges.push(range);
+        }
+    }
+    if let Some(range) = open.take() {
+        ranges.push(range);
+    }
+    if ranges.is_empty() {
+        return;
+    }
+    if changed as f32 / count as f32 > 0.3 {
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+    } else {
+        for (start, end) in ranges {
+            queue.write_buffer(
+                buffer,
+                start as u64 * 112,
+                bytemuck::cast_slice(&data[start * 28..end * 28]),
+            );
+        }
+    }
+    cached.clear();
+    cached.extend_from_slice(data);
 }
 
 struct GltfNode {
@@ -2928,6 +2996,7 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
         bounds_buffer,
         cull_buffer,
         objects_bind_group: None,
+        cached_instances: Vec::new(),
     }
 }
 
@@ -3206,11 +3275,12 @@ impl PassNode for GeometryPass {
                 data.push(material.orm_layer as f32);
                 data.push(material.emissive_layer as f32);
             }
-            upload_instances(
+            upload_instances_diff(
                 context.device,
                 context.queue,
                 &mut mesh.instance_buffer,
                 &mut mesh.instance_capacity,
+                &mut mesh.cached_instances,
                 &data,
                 count,
             );
