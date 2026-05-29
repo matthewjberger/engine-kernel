@@ -3,7 +3,7 @@
 @group(0) @binding(2) var output_texture: texture_storage_2d_array<rgba16float, write>;
 
 const PI: f32 = 3.141592653589793;
-const FACE_SIZE: u32 = 1024u;
+const FACE_SIZE: u32 = 2048u;
 
 fn cube_to_world(face: u32, uv: vec2<f32>) -> vec3<f32> {
     let x = 2.0 * uv.x - 1.0;

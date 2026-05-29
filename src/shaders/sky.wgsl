@@ -25,7 +25,7 @@ struct SkyOutput {
     @location(1) normal: vec4<f32>,
 }
 @fragment fn fs(in: VertexOutput) -> SkyOutput {
-    let color = textureSampleLevel(environment, environment_sampler, normalize(in.world_direction), 0.0).rgb;
+    let color = clamp(textureSampleLevel(environment, environment_sampler, normalize(in.world_direction), 0.0).rgb, vec3<f32>(0.0), vec3<f32>(65000.0));
     var out: SkyOutput;
     out.color = vec4<f32>(color, 1.0);
     out.normal = vec4<f32>(0.0, 0.0, 1.0, 1.0);

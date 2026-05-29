@@ -1056,6 +1056,21 @@ fn spin_system(world: &mut World) {
     }
 }
 
+fn move_lights_system(world: &mut World) {
+    let delta_time = world.resources.delta_time;
+    for entity in collect_entities(world, LIGHT | RENDER_MESH | LOCAL_TRANSFORM) {
+        if let Some(local) = get_local_transform_mut(world, entity) {
+            let radius = (local.translation.x * local.translation.x
+                + local.translation.z * local.translation.z)
+                .sqrt();
+            let angle = local.translation.z.atan2(local.translation.x) + delta_time * 0.4;
+            local.translation.x = angle.cos() * radius;
+            local.translation.z = angle.sin() * radius;
+        }
+        mark_local_transform_dirty(world, entity);
+    }
+}
+
 fn input_system(world: &mut World) {
     let events = std::mem::take(&mut world.resources.events);
     let input = &mut world.resources.input;
@@ -1467,6 +1482,7 @@ fn gather_lights(world: &World) -> ([f32; 144], Vec<Mat4>) {
     data[1] = 0.03;
     data[2] = 0.04;
     let mut point_count = 0usize;
+    let mut point_shadow_count = 0usize;
     let mut spot_shadows = Vec::new();
     for table in &world.tables {
         if table.mask & (LIGHT | GLOBAL_TRANSFORM) != (LIGHT | GLOBAL_TRANSFORM) {
@@ -1501,6 +1517,7 @@ fn gather_lights(world: &World) -> ([f32; 144], Vec<Mat4>) {
                     let direction_slot = 80 + point_count * 4;
                     let shadow_slot = 112 + point_count * 4;
                     data[shadow_slot] = -1.0;
+                    data[shadow_slot + 1] = -1.0;
                     if light.kind == LightKind::Spot {
                         let direction = transform_forward(&global);
                         data[direction_slot] = direction.x;
@@ -1528,6 +1545,10 @@ fn gather_lights(world: &World) -> ([f32; 144], Vec<Mat4>) {
                     } else {
                         data[direction_slot + 3] = -2.0;
                         data[color_slot + 3] = -2.0;
+                        if point_shadow_count < 4 {
+                            data[shadow_slot + 1] = point_shadow_count as f32;
+                            point_shadow_count += 1;
+                        }
                     }
                     point_count += 1;
                 }
@@ -1576,6 +1597,12 @@ impl State for Demo {
             "transforms",
             "spin",
             spin_system,
+        );
+        schedule_insert_before(
+            &mut world.resources.schedule,
+            "transforms",
+            "move_lights",
+            move_lights_system,
         );
         schedule_insert_before(
             &mut world.resources.schedule,
@@ -1654,6 +1681,48 @@ impl State for Demo {
         }
         mark_local_transform_dirty(world, spot);
 
+        let orbit_lights = [
+            (
+                nalgebra_glm::vec3(1.0, 0.25, 0.25),
+                nalgebra_glm::vec3(3.0, 0.6, 0.0),
+            ),
+            (
+                nalgebra_glm::vec3(0.3, 1.0, 0.4),
+                nalgebra_glm::vec3(0.0, 0.6, 3.2),
+            ),
+            (
+                nalgebra_glm::vec3(0.35, 0.5, 1.0),
+                nalgebra_glm::vec3(-3.4, 0.6, 1.6),
+            ),
+            (
+                nalgebra_glm::vec3(1.0, 0.85, 0.35),
+                nalgebra_glm::vec3(1.8, 0.6, -3.0),
+            ),
+        ];
+        for (color, position) in orbit_lights {
+            let orb = spawn(
+                world,
+                LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | EMISSIVE | LIGHT,
+            );
+            if let Some(local) = get_local_transform_mut(world, orb) {
+                local.translation = position;
+                local.scale = nalgebra_glm::vec3(0.18, 0.18, 0.18);
+            }
+            if let Some(render_mesh) = get_render_mesh_mut(world, orb) {
+                render_mesh.0 = 1;
+            }
+            if let Some(emissive) = get_emissive_mut(world, orb) {
+                emissive.0 = color * 8.0;
+            }
+            if let Some(light) = get_light_mut(world, orb) {
+                light.color = color;
+                light.intensity = 40.0;
+                light.kind = LightKind::Point;
+                light.range = 12.0;
+            }
+            mark_local_transform_dirty(world, orb);
+        }
+
         world.resources.commands.push(SpawnCommand {
             mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | EMISSIVE,
             transform: LocalTransform {
@@ -1667,7 +1736,7 @@ impl State for Demo {
         });
 
         world.resources.commands.push(SpawnCommand {
-            mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | MATERIAL,
+            mask: LOCAL_TRANSFORM | GLOBAL_TRANSFORM | RENDER_MESH | MATERIAL | EMISSIVE,
             transform: LocalTransform {
                 translation: nalgebra_glm::vec3(0.0, -1.0, 0.0),
                 scale: nalgebra_glm::vec3(10.0, 0.1, 10.0),
@@ -1732,6 +1801,53 @@ const CUBE_VERTICES: [f32; 324] = [
     0.65, 0., 0., -1., -1., 1., -1., 0.65, 0.65, 0.65, 0., 0., -1., 1., 1., -1., 0.65, 0.65, 0.65,
     0., 0., -1.,
 ];
+
+fn sphere_mesh(rings: usize, sectors: usize) -> Vec<f32> {
+    let mut vertices = Vec::with_capacity(rings * sectors * 6 * 11);
+    let point = |ring: usize, sector: usize| {
+        let theta = ring as f32 / rings as f32 * std::f32::consts::PI;
+        let phi = sector as f32 / sectors as f32 * std::f32::consts::TAU;
+        (
+            [
+                theta.sin() * phi.cos(),
+                theta.cos(),
+                theta.sin() * phi.sin(),
+            ],
+            [sector as f32 / sectors as f32, ring as f32 / rings as f32],
+        )
+    };
+    for ring in 0..rings {
+        for sector in 0..sectors {
+            let (p00, uv00) = point(ring, sector);
+            let (p10, uv10) = point(ring + 1, sector);
+            let (p01, uv01) = point(ring, sector + 1);
+            let (p11, uv11) = point(ring + 1, sector + 1);
+            for (position, uv) in [
+                (p00, uv00),
+                (p10, uv10),
+                (p11, uv11),
+                (p00, uv00),
+                (p11, uv11),
+                (p01, uv01),
+            ] {
+                vertices.extend_from_slice(&[
+                    position[0],
+                    position[1],
+                    position[2],
+                    1.0,
+                    1.0,
+                    1.0,
+                    position[0],
+                    position[1],
+                    position[2],
+                    uv[0],
+                    uv[1],
+                ]);
+            }
+        }
+    }
+    vertices
+}
 
 const CLUSTER_X: u32 = 16;
 const CLUSTER_Y: u32 = 9;
@@ -2256,11 +2372,10 @@ struct GeometryPass {
     sky_pipeline: wgpu::RenderPipeline,
     sky_bind_group: wgpu::BindGroup,
     point_pipeline: wgpu::RenderPipeline,
-    point_face_views: [wgpu::TextureView; 6],
+    point_face_views: [wgpu::TextureView; 24],
     point_depth_view: wgpu::TextureView,
-    point_face_buffers: [wgpu::Buffer; 6],
-    point_face_bind_groups: [wgpu::BindGroup; 6],
-    point_cube_params_buffer: wgpu::Buffer,
+    point_face_buffers: [wgpu::Buffer; 24],
+    point_face_bind_groups: [wgpu::BindGroup; 24],
     meshes: Vec<MeshGpu>,
     skinned: Vec<SkinnedGpu>,
     skin_pipeline: wgpu::ComputePipeline,
@@ -3013,6 +3128,8 @@ struct SkinnedGpu {
     instance_capacity: u32,
     visible_indices_buffer: wgpu::Buffer,
     objects_bind_group: Option<wgpu::BindGroup>,
+    shadow_bind_group: Option<wgpu::BindGroup>,
+    point_bind_group: Option<wgpu::BindGroup>,
 }
 
 fn skinned_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[u32]) -> SkinnedGpu {
@@ -3057,6 +3174,8 @@ fn skinned_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[u32]) -> 
         instance_capacity: 1,
         visible_indices_buffer,
         objects_bind_group: None,
+        shadow_bind_group: None,
+        point_bind_group: None,
     }
 }
 
@@ -3068,6 +3187,7 @@ impl GeometryPass {
         bind_groups: &[wgpu::BindGroup],
         count: usize,
         counts: &[u32],
+        skinned_draws: &[(usize, u32)],
     ) {
         for (slot, bind_group) in bind_groups.iter().take(count).enumerate() {
             let load = if slot == 0 {
@@ -3100,6 +3220,14 @@ impl GeometryPass {
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     pass.set_bind_group(1, group, &[]);
                     pass.draw(0..mesh.vertex_count, 0..counts[handle]);
+                }
+            }
+            for &(handle, vertex_count) in skinned_draws {
+                let skinned = &self.skinned[handle];
+                if let Some(group) = &skinned.shadow_bind_group {
+                    pass.set_vertex_buffer(0, skinned.output_buffer.slice(..));
+                    pass.set_bind_group(1, group, &[]);
+                    pass.draw(0..vertex_count, 0..1);
                 }
             }
         }
@@ -3357,102 +3485,6 @@ impl PassNode for GeometryPass {
             cull.dispatch_workgroups(count.div_ceil(64), 1, 1);
         }
 
-        self.render_shadow_atlas(
-            context.encoder,
-            &self.shadow_view,
-            &self.cascade_bind_groups,
-            4,
-            &counts,
-        );
-        self.render_shadow_atlas(
-            context.encoder,
-            &self.spot_atlas_view,
-            &self.spot_bind_groups,
-            spot_shadows.len(),
-            &counts,
-        );
-
-        let point_count = lights[12] as usize;
-        let mut point_index = -1i32;
-        let mut point_position = Vec3::zeros();
-        let mut point_range = 1.0f32;
-        for index in 0..point_count {
-            if lights[80 + index * 4 + 3] < -1.5 {
-                point_index = index as i32;
-                point_position = nalgebra_glm::vec3(
-                    lights[16 + index * 4],
-                    lights[16 + index * 4 + 1],
-                    lights[16 + index * 4 + 2],
-                );
-                point_range = lights[16 + index * 4 + 3].max(0.5);
-                break;
-            }
-        }
-        context.queue.write_buffer(
-            &self.point_cube_params_buffer,
-            0,
-            bytemuck::cast_slice(&[point_index as f32, 0.02, 0.0, 0.0]),
-        );
-        if point_index >= 0 {
-            let y_flip = Mat4::new(
-                1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-            );
-            let projection =
-                y_flip * reverse_z_perspective(std::f32::consts::FRAC_PI_2, 1.0, 0.05, point_range);
-            for (face, (direction, up)) in CUBE_FACES.iter().enumerate() {
-                let target = point_position + direction;
-                let view_projection =
-                    projection * nalgebra_glm::look_at(&point_position, &target, up);
-                let mut face_data = [0.0f32; 20];
-                face_data[..16].copy_from_slice(view_projection.as_slice());
-                face_data[16..19].copy_from_slice(point_position.as_slice());
-                face_data[19] = point_range;
-                context.queue.write_buffer(
-                    &self.point_face_buffers[face],
-                    0,
-                    bytemuck::cast_slice(&face_data),
-                );
-            }
-            for (face, face_view) in self.point_face_views.iter().enumerate() {
-                let mut point_pass =
-                    context
-                        .encoder
-                        .begin_render_pass(&wgpu::RenderPassDescriptor {
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: face_view,
-                                resolve_target: None,
-                                depth_slice: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: Some(
-                                wgpu::RenderPassDepthStencilAttachment {
-                                    view: &self.point_depth_view,
-                                    depth_ops: Some(wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(0.0),
-                                        store: wgpu::StoreOp::Store,
-                                    }),
-                                    stencil_ops: None,
-                                },
-                            ),
-                            ..Default::default()
-                        });
-                point_pass.set_pipeline(&self.point_pipeline);
-                point_pass.set_bind_group(0, &self.point_face_bind_groups[face], &[]);
-                for (handle, mesh) in self.meshes.iter().enumerate() {
-                    if counts[handle] > 0
-                        && let Some(group) = &mesh.point_bind_group
-                    {
-                        point_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                        point_pass.set_bind_group(1, group, &[]);
-                        point_pass.draw(0..mesh.vertex_count, 0..counts[handle]);
-                    }
-                }
-            }
-        }
-
         let skinned = skinned_instances(context.world);
         let mut joint_data: Vec<f32> = Vec::new();
         let mut skinned_draws: Vec<(usize, u32)> = Vec::new();
@@ -3501,6 +3533,16 @@ impl PassNode for GeometryPass {
                     (1, target.visible_indices_buffer.as_entire_binding()),
                 ],
             ));
+            target.shadow_bind_group = Some(bind_group(
+                context.device,
+                &self.shadow_pipeline.get_bind_group_layout(1),
+                vec![(0, target.instance_buffer.as_entire_binding())],
+            ));
+            target.point_bind_group = Some(bind_group(
+                context.device,
+                &self.point_pipeline.get_bind_group_layout(1),
+                vec![(0, target.instance_buffer.as_entire_binding())],
+            ));
             skinned_draws.push((handle, vertex_count));
         }
         if !joint_data.is_empty() {
@@ -3535,6 +3577,104 @@ impl PassNode for GeometryPass {
                 compute.set_bind_group(0, &bind, &[]);
                 compute.dispatch_workgroups(vertex_count.div_ceil(64), 1, 1);
             }
+        }
+
+        self.render_shadow_atlas(
+            context.encoder,
+            &self.shadow_view,
+            &self.cascade_bind_groups,
+            4,
+            &counts,
+            &skinned_draws,
+        );
+        self.render_shadow_atlas(
+            context.encoder,
+            &self.spot_atlas_view,
+            &self.spot_bind_groups,
+            spot_shadows.len(),
+            &counts,
+            &skinned_draws,
+        );
+
+        let point_count = lights[12] as usize;
+        let y_flip = Mat4::new(
+            1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        );
+        let mut shadow_slot = 0usize;
+        for index in 0..point_count {
+            if shadow_slot >= 4 || lights[80 + index * 4 + 3] >= -1.5 {
+                continue;
+            }
+            let point_position = nalgebra_glm::vec3(
+                lights[16 + index * 4],
+                lights[16 + index * 4 + 1],
+                lights[16 + index * 4 + 2],
+            );
+            let point_range = lights[16 + index * 4 + 3].max(0.5);
+            let projection =
+                y_flip * reverse_z_perspective(std::f32::consts::FRAC_PI_2, 1.0, 0.05, point_range);
+            for (face, (direction, up)) in CUBE_FACES.iter().enumerate() {
+                let target = point_position + direction;
+                let view_projection =
+                    projection * nalgebra_glm::look_at(&point_position, &target, up);
+                let mut face_data = [0.0f32; 20];
+                face_data[..16].copy_from_slice(view_projection.as_slice());
+                face_data[16..19].copy_from_slice(point_position.as_slice());
+                face_data[19] = point_range;
+                context.queue.write_buffer(
+                    &self.point_face_buffers[shadow_slot * 6 + face],
+                    0,
+                    bytemuck::cast_slice(&face_data),
+                );
+            }
+            for face in 0..6 {
+                let layer = shadow_slot * 6 + face;
+                let mut point_pass =
+                    context
+                        .encoder
+                        .begin_render_pass(&wgpu::RenderPassDescriptor {
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &self.point_face_views[layer],
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: Some(
+                                wgpu::RenderPassDepthStencilAttachment {
+                                    view: &self.point_depth_view,
+                                    depth_ops: Some(wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(0.0),
+                                        store: wgpu::StoreOp::Store,
+                                    }),
+                                    stencil_ops: None,
+                                },
+                            ),
+                            ..Default::default()
+                        });
+                point_pass.set_pipeline(&self.point_pipeline);
+                point_pass.set_bind_group(0, &self.point_face_bind_groups[layer], &[]);
+                for (handle, mesh) in self.meshes.iter().enumerate() {
+                    if counts[handle] > 0
+                        && let Some(group) = &mesh.point_bind_group
+                    {
+                        point_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        point_pass.set_bind_group(1, group, &[]);
+                        point_pass.draw(0..mesh.vertex_count, 0..counts[handle]);
+                    }
+                }
+                for &(skinned_handle, vertex_count) in &skinned_draws {
+                    let skinned = &self.skinned[skinned_handle];
+                    if let Some(group) = &skinned.point_bind_group {
+                        point_pass.set_vertex_buffer(0, skinned.output_buffer.slice(..));
+                        point_pass.set_bind_group(1, group, &[]);
+                        point_pass.draw(0..vertex_count, 0..1);
+                    }
+                }
+            }
+            shadow_slot += 1;
         }
 
         let (color_view, color_load, color_store) = color_attachment(context, "color");
@@ -4087,8 +4227,8 @@ fn filter_params(
         output_size,
         roughness.to_bits(),
         samples,
-        1024,
-        1024,
+        2048,
+        2048,
         distribution,
         mips,
     ]
@@ -4141,8 +4281,8 @@ fn generate_ibl(
     wgpu::TextureView,
     wgpu::Sampler,
 ) {
-    let env_mips = 11u32;
-    let env = ibl_storage_texture(device, 1024, 6, env_mips);
+    let env_mips = 12u32;
+    let env = ibl_storage_texture(device, 2048, 6, env_mips);
     let irradiance = ibl_storage_texture(device, 64, 6, 1);
     let prefiltered = ibl_storage_texture(device, 512, 6, 5);
     let brdf = ibl_storage_texture(device, 256, 1, 1);
@@ -4184,11 +4324,11 @@ fn generate_ibl(
         queue,
         &equirect_pipeline,
         &equirect_bind,
-        (64, 64, 6),
+        (128, 128, 6),
     );
 
     for mip in 1..env_mips {
-        let size = 1024u32 >> mip;
+        let size = 2048u32 >> mip;
         let source = array_mip_view(&env, mip - 1);
         let destination = array_mip_view(&env, mip);
         let params = uniform_buffer(device, 16);
@@ -4397,7 +4537,10 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let character = fetch_gltf(
         "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/CesiumMan/glTF-Binary/CesiumMan.glb",
     );
-    let mut meshes = vec![mesh_gpu(&device, &queue, &with_uv(&CUBE_VERTICES))];
+    let mut meshes = vec![
+        mesh_gpu(&device, &queue, &with_uv(&CUBE_VERTICES)),
+        mesh_gpu(&device, &queue, &sphere_mesh(16, 32)),
+    ];
     if let Some(ref import) = helmet {
         for primitive in &import.primitives {
             meshes.push(mesh_gpu(&device, &queue, primitive));
@@ -4492,7 +4635,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             emissive_layer: 4,
         },
         emissive: import.emissive_factor,
-        mesh_base: 1,
+        mesh_base: 2,
         skinned_mesh_base: 0,
         skins: import.skins,
         animations: import.animations,
@@ -4517,7 +4660,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let equirect_view = equirect_texture(
         &device,
         &queue,
-        "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/symmetrical_garden_02_1k.hdr",
+        "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k/symmetrical_garden_02_2k.hdr",
     );
     let (env_cube_view, irradiance_view, prefiltered_view, brdf_view, ibl_sampler) =
         generate_ibl(&device, &queue, &equirect_view);
@@ -4538,7 +4681,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         size: wgpu::Extent3d {
             width: 512,
             height: 512,
-            depth_or_array_layers: 6,
+            depth_or_array_layers: 24,
         },
         mip_level_count: 1,
         sample_count: 1,
@@ -4548,13 +4691,13 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         view_formats: &[],
     });
     let point_cube_view = point_cube_texture.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::Cube),
+        dimension: Some(wgpu::TextureViewDimension::CubeArray),
         ..Default::default()
     });
-    let point_face_views: [wgpu::TextureView; 6] = std::array::from_fn(|face| {
+    let point_face_views: [wgpu::TextureView; 24] = std::array::from_fn(|layer| {
         point_cube_texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2),
-            base_array_layer: face as u32,
+            base_array_layer: layer as u32,
             array_layer_count: Some(1),
             ..Default::default()
         })
@@ -4575,14 +4718,13 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             view_formats: &[],
         })
         .create_view(&Default::default());
-    let point_cube_params_buffer = uniform_buffer(&device, 16);
-    let point_face_buffers: [wgpu::Buffer; 6] =
+    let point_face_buffers: [wgpu::Buffer; 24] =
         std::array::from_fn(|_| uniform_buffer(&device, 80));
-    let point_face_bind_groups: [wgpu::BindGroup; 6] = std::array::from_fn(|face| {
+    let point_face_bind_groups: [wgpu::BindGroup; 24] = std::array::from_fn(|layer| {
         bind_group(
             &device,
             &point_pipeline.get_bind_group_layout(0),
-            vec![(0, point_face_buffers[face].as_entire_binding())],
+            vec![(0, point_face_buffers[layer].as_entire_binding())],
         )
     });
     let geometry_bind_group = bind_group(
@@ -4609,7 +4751,6 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             (17, wgpu::BindingResource::TextureView(&orm_array_view)),
             (18, wgpu::BindingResource::TextureView(&emissive_array_view)),
             (19, wgpu::BindingResource::TextureView(&point_cube_view)),
-            (20, point_cube_params_buffer.as_entire_binding()),
         ],
     );
     let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -4744,7 +4885,6 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             point_depth_view,
             point_face_buffers,
             point_face_bind_groups,
-            point_cube_params_buffer,
             meshes,
             skinned,
             skin_pipeline,

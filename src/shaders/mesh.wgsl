@@ -59,17 +59,55 @@ struct LightGrid {
 @group(0) @binding(16) var normal_textures: texture_2d_array<f32>;
 @group(0) @binding(17) var orm_textures: texture_2d_array<f32>;
 @group(0) @binding(18) var emissive_textures: texture_2d_array<f32>;
-@group(0) @binding(19) var point_cube: texture_cube<f32>;
-@group(0) @binding(20) var<uniform> point_cube_params: vec4<f32>;
+@group(0) @binding(19) var point_shadow_cubemap: texture_cube_array<f32>;
 
-fn point_shadow_factor(index: u32, world_position: vec3<f32>) -> f32 {
-    if i32(index) != i32(point_cube_params.x) {
+const PCF_SAMPLES_20: array<vec3<f32>, 20> = array<vec3<f32>, 20>(
+    vec3<f32>(1.0, 0.0, 0.0),
+    vec3<f32>(-1.0, 0.0, 0.0),
+    vec3<f32>(0.0, 1.0, 0.0),
+    vec3<f32>(0.0, -1.0, 0.0),
+    vec3<f32>(0.0, 0.0, 1.0),
+    vec3<f32>(0.0, 0.0, -1.0),
+    vec3<f32>(0.707, 0.707, 0.0),
+    vec3<f32>(-0.707, 0.707, 0.0),
+    vec3<f32>(0.707, -0.707, 0.0),
+    vec3<f32>(-0.707, -0.707, 0.0),
+    vec3<f32>(0.707, 0.0, 0.707),
+    vec3<f32>(-0.707, 0.0, 0.707),
+    vec3<f32>(0.707, 0.0, -0.707),
+    vec3<f32>(-0.707, 0.0, -0.707),
+    vec3<f32>(0.0, 0.707, 0.707),
+    vec3<f32>(0.0, -0.707, 0.707),
+    vec3<f32>(0.0, 0.707, -0.707),
+    vec3<f32>(0.0, -0.707, -0.707),
+    vec3<f32>(0.577, 0.577, 0.577),
+    vec3<f32>(-0.577, -0.577, -0.577),
+);
+
+fn point_shadow_factor(index: u32, world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let slot = i32(lights.point_shadow[index].y);
+    if slot < 0 {
         return 1.0;
     }
-    let to_fragment = world_position - lights.point_position[index].xyz;
-    let distance = length(to_fragment) / lights.point_position[index].w;
-    let sampled = textureSampleLevel(point_cube, ibl_sampler, normalize(to_fragment), 0.0).r;
-    return select(0.0, 1.0, distance - point_cube_params.y <= sampled);
+    let light_position = lights.point_position[index].xyz;
+    let light_range = lights.point_position[index].w;
+    let to_fragment = world_position - light_position;
+    let distance = length(to_fragment);
+    if distance > light_range {
+        return 1.0;
+    }
+    let direction = normalize(to_fragment);
+    let normalized_distance = distance / light_range;
+    let slope = 1.0 - abs(dot(normal, -direction));
+    let bias = 0.02 * (1.0 + slope * 2.0);
+    let distance_with_bias = normalized_distance - bias;
+    var shadow = 0.0;
+    for (var sample_index = 0; sample_index < 20; sample_index = sample_index + 1) {
+        let sample_dir = normalize(direction + PCF_SAMPLES_20[sample_index] * 0.02);
+        let sampled = textureSampleLevel(point_shadow_cubemap, ibl_sampler, sample_dir, slot, 0.0).r;
+        shadow = shadow + select(0.0, 1.0, distance_with_bias <= sampled);
+    }
+    return shadow / 20.0;
 }
 
 fn cotangent_frame(normal: vec3<f32>, position: vec3<f32>, uv: vec2<f32>) -> mat3x3<f32> {
@@ -363,14 +401,17 @@ fn lighting(
         let to_light = lights.point_position[index].xyz - world_position;
         let distance = max(length(to_light), 0.0001);
         let attenuation = range_attenuation(lights.point_position[index].w, distance);
-        let spot = spot_attenuation(
-            lights.point_direction[index].xyz,
-            to_light,
-            lights.point_direction[index].w,
-            lights.point_color[index].w,
-        );
+        var spot = 1.0;
+        if lights.point_direction[index].w > -1.5 {
+            spot = spot_attenuation(
+                lights.point_direction[index].xyz,
+                to_light,
+                lights.point_direction[index].w,
+                lights.point_color[index].w,
+            );
+        }
         let spot_visibility = spot_shadow_factor(world_position, i32(lights.point_shadow[index].x));
-        let point_visibility = point_shadow_factor(index, world_position);
+        let point_visibility = point_shadow_factor(index, world_position, normal);
         let radiance =
             lights.point_color[index].rgb * attenuation * spot * spot_visibility * point_visibility;
         color += brdf(normal, view, to_light / distance, radiance, albedo, metallic, roughness, f0);
