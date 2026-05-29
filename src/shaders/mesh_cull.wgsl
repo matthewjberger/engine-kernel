@@ -25,7 +25,7 @@ struct CullUniform {
     _pad2: u32,
 }
 @group(0) @binding(0) var<storage, read> source: array<Instance>;
-@group(0) @binding(1) var<storage, read_write> culled: array<Instance>;
+@group(0) @binding(1) var<storage, read_write> visible_indices: array<u32>;
 @group(0) @binding(2) var<storage, read_write> indirect: DrawIndirect;
 @group(0) @binding(3) var<uniform> bounds: Bounds;
 @group(0) @binding(4) var<uniform> cull: CullUniform;
@@ -51,6 +51,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     if visible {
         let write_index = atomicAdd(&indirect.instance_count, 1u);
-        culled[write_index] = instance;
+        visible_indices[write_index] = index;
     }
 }

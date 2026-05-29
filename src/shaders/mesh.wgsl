@@ -248,15 +248,19 @@ struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) color: vec3<f32>,
     @location(7) normal: vec3<f32>,
-    @location(2) model_0: vec4<f32>,
-    @location(3) model_1: vec4<f32>,
-    @location(4) model_2: vec4<f32>,
-    @location(5) model_3: vec4<f32>,
-    @location(6) emissive: vec4<f32>,
-    @location(8) albedo_metallic: vec4<f32>,
-    @location(9) layers: vec4<f32>,
     @location(13) uv: vec2<f32>,
 }
+struct Instance {
+    model_0: vec4<f32>,
+    model_1: vec4<f32>,
+    model_2: vec4<f32>,
+    model_3: vec4<f32>,
+    emissive: vec4<f32>,
+    albedo_metallic: vec4<f32>,
+    layers: vec4<f32>,
+}
+@group(1) @binding(0) var<storage, read> objects: array<Instance>;
+@group(1) @binding(1) var<storage, read> visible_indices: array<u32>;
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
@@ -373,8 +377,9 @@ fn lighting(
     }
     return color;
 }
-@vertex fn vs(in: VertexInput) -> VertexOutput {
-    let model = mat4x4<f32>(in.model_0, in.model_1, in.model_2, in.model_3);
+@vertex fn vs(in: VertexInput, @builtin(instance_index) instance_index: u32) -> VertexOutput {
+    let object = objects[visible_indices[instance_index]];
+    let model = mat4x4<f32>(object.model_0, object.model_1, object.model_2, object.model_3);
     let world = model * vec4<f32>(in.position, 1.0);
     let clip = camera.view_projection * world;
     let world_normal = (model * vec4<f32>(in.normal, 0.0)).xyz;
@@ -383,17 +388,17 @@ fn lighting(
     return VertexOutput(
         clip,
         vec4<f32>(in.color, 1.0),
-        in.emissive.rgb,
+        object.emissive.rgb,
         view_normal,
         world.xyz,
         world_normal,
-        in.albedo_metallic.rgb,
-        vec2<f32>(in.albedo_metallic.w, in.emissive.w),
-        u32(in.layers.x),
-        select(planar_uv(in.position * model_scale, in.normal), in.uv, in.layers.x >= 4.0),
-        u32(in.layers.y),
-        u32(in.layers.z),
-        u32(in.layers.w),
+        object.albedo_metallic.rgb,
+        vec2<f32>(object.albedo_metallic.w, object.emissive.w),
+        u32(object.layers.x),
+        select(planar_uv(in.position * model_scale, in.normal), in.uv, object.layers.x >= 4.0),
+        u32(object.layers.y),
+        u32(object.layers.z),
+        u32(object.layers.w),
     );
 }
 fn planar_uv(local_position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {

@@ -2226,10 +2226,11 @@ struct MeshGpu {
     vertex_count: u32,
     instance_buffer: wgpu::Buffer,
     instance_capacity: u32,
-    culled_buffer: wgpu::Buffer,
+    visible_indices_buffer: wgpu::Buffer,
     indirect_buffer: wgpu::Buffer,
     bounds_buffer: wgpu::Buffer,
     cull_buffer: wgpu::Buffer,
+    objects_bind_group: Option<wgpu::BindGroup>,
 }
 
 struct GeometryPass {
@@ -2877,12 +2878,10 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
             | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let culled_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    let visible_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 112,
-        usage: wgpu::BufferUsages::VERTEX
-            | wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST,
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2924,10 +2923,11 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
         vertex_count: vertices.len() as u32 / 11,
         instance_buffer,
         instance_capacity: 1,
-        culled_buffer,
+        visible_indices_buffer,
         indirect_buffer,
         bounds_buffer,
         cull_buffer,
+        objects_bind_group: None,
     }
 }
 
@@ -2938,6 +2938,8 @@ struct SkinnedGpu {
     vertex_count: u32,
     instance_buffer: wgpu::Buffer,
     instance_capacity: u32,
+    visible_indices_buffer: wgpu::Buffer,
+    objects_bind_group: Option<wgpu::BindGroup>,
 }
 
 fn skinned_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[u32]) -> SkinnedGpu {
@@ -2961,9 +2963,18 @@ fn skinned_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[u32]) -> 
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 112,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let visible_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&visible_indices_buffer, 0, bytemuck::cast_slice(&[0u32]));
     SkinnedGpu {
         rest_buffer,
         output_buffer,
@@ -2971,6 +2982,8 @@ fn skinned_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[u32]) -> 
         vertex_count,
         instance_buffer,
         instance_capacity: 1,
+        visible_indices_buffer,
+        objects_bind_group: None,
     }
 }
 
@@ -3205,16 +3218,15 @@ impl PassNode for GeometryPass {
             if count == 0 {
                 continue;
             }
-            let needed = mesh.instance_capacity as u64 * 112;
-            if mesh.culled_buffer.size() < needed {
-                mesh.culled_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None,
-                    size: needed,
-                    usage: wgpu::BufferUsages::VERTEX
-                        | wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
+            let needed = mesh.instance_capacity as u64 * 4;
+            if mesh.visible_indices_buffer.size() < needed {
+                mesh.visible_indices_buffer =
+                    context.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: None,
+                        size: needed,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
             }
             context.queue.write_buffer(
                 &mesh.indirect_buffer,
@@ -3234,12 +3246,20 @@ impl PassNode for GeometryPass {
                 &self.cull_pipeline.get_bind_group_layout(0),
                 vec![
                     (0, mesh.instance_buffer.as_entire_binding()),
-                    (1, mesh.culled_buffer.as_entire_binding()),
+                    (1, mesh.visible_indices_buffer.as_entire_binding()),
                     (2, mesh.indirect_buffer.as_entire_binding()),
                     (3, mesh.bounds_buffer.as_entire_binding()),
                     (4, mesh.cull_buffer.as_entire_binding()),
                 ],
             );
+            mesh.objects_bind_group = Some(bind_group(
+                context.device,
+                &self.pipeline.get_bind_group_layout(1),
+                vec![
+                    (0, mesh.instance_buffer.as_entire_binding()),
+                    (1, mesh.visible_indices_buffer.as_entire_binding()),
+                ],
+            ));
             let mut cull = context
                 .encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3385,6 +3405,14 @@ impl PassNode for GeometryPass {
                 &instance,
                 1,
             );
+            target.objects_bind_group = Some(bind_group(
+                context.device,
+                &self.pipeline.get_bind_group_layout(1),
+                vec![
+                    (0, target.instance_buffer.as_entire_binding()),
+                    (1, target.visible_indices_buffer.as_entire_binding()),
+                ],
+            ));
             skinned_draws.push((handle, vertex_count));
         }
         if !joint_data.is_empty() {
@@ -3463,17 +3491,21 @@ impl PassNode for GeometryPass {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         for (handle, mesh) in self.meshes.iter().enumerate() {
-            if counts[handle] > 0 {
+            if counts[handle] > 0
+                && let Some(group) = &mesh.objects_bind_group
+            {
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                pass.set_vertex_buffer(1, mesh.culled_buffer.slice(..));
+                pass.set_bind_group(1, group, &[]);
                 pass.draw_indirect(&mesh.indirect_buffer, 0);
             }
         }
         for &(handle, vertex_count) in &skinned_draws {
             let skinned = &self.skinned[handle];
-            pass.set_vertex_buffer(0, skinned.output_buffer.slice(..));
-            pass.set_vertex_buffer(1, skinned.instance_buffer.slice(..));
-            pass.draw(0..vertex_count, 0..1);
+            if let Some(group) = &skinned.objects_bind_group {
+                pass.set_vertex_buffer(0, skinned.output_buffer.slice(..));
+                pass.set_bind_group(1, group, &[]);
+                pass.draw(0..vertex_count, 0..1);
+            }
         }
     }
 }
@@ -4229,10 +4261,15 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             attributes: &instance_attrs,
         },
     ];
+    let mesh_color_buffers = [wgpu::VertexBufferLayout {
+        array_stride: 44,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &vertex_attrs,
+    }];
     let pipeline = render_pipeline(
         &device,
         &shader,
-        &mesh_buffers,
+        &mesh_color_buffers,
         &[Some(SCENE_FORMAT.into()), Some(SCENE_FORMAT.into())],
         true,
         wgpu::CompareFunction::Greater,
