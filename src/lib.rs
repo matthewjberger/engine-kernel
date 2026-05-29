@@ -535,6 +535,7 @@ struct Resources {
     events: Vec<InputEvent>,
     commands: Vec<SpawnCommand>,
     bloom_enabled: bool,
+    ssr_enabled: bool,
 }
 
 #[derive(Default)]
@@ -555,6 +556,7 @@ fn new_world() -> World {
         resources: Resources {
             viewport: (1.0, 1.0),
             bloom_enabled: true,
+            ssr_enabled: true,
             ..Default::default()
         },
         ..Default::default()
@@ -3550,7 +3552,12 @@ fn ssr_update(context: &PassContext, buffer: &wgpu::Buffer) {
     data[36] = 0.7f32.to_bits();
     data[37] = 1.0f32.to_bits();
     data[38] = 0.7f32.to_bits();
-    data[39] = 1.0f32.to_bits();
+    let enabled = if context.world.resources.ssr_enabled {
+        1.0f32
+    } else {
+        0.0f32
+    };
+    data[39] = enabled.to_bits();
     context
         .queue
         .write_buffer(buffer, 0, bytemuck::cast_slice(&data));
@@ -4891,6 +4898,7 @@ fn render(graphics: &mut Graphics, world: &mut World) {
     let physical_targets = graphics.graph.physical_formats.len();
 
     let mut bloom_enabled = world.resources.bloom_enabled;
+    let mut ssr_enabled = world.resources.ssr_enabled;
     let egui_output = graphics.egui_state.egui_ctx().run_ui(egui_input, |ui| {
         egui::Window::new("engine").show(ui.ctx(), |ui| {
             ui.label("Spinning triangles + emissive cube");
@@ -4899,10 +4907,12 @@ fn render(graphics: &mut Graphics, world: &mut World) {
                 "render targets: {logical_targets} logical / {physical_targets} physical"
             ));
             ui.checkbox(&mut bloom_enabled, "bloom");
+            ui.checkbox(&mut ssr_enabled, "ssr");
             ui.label("drag-left orbit, drag-right pan, scroll zoom");
         });
     });
     world.resources.bloom_enabled = bloom_enabled;
+    world.resources.ssr_enabled = ssr_enabled;
     graphics
         .egui_state
         .handle_platform_output(&graphics.window, egui_output.platform_output);
