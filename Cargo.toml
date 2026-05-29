@@ -17,6 +17,7 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 egui = "0.34"
 egui-wgpu = { version = "0.34", features = ["winit"] }
 futures = "0.3.32"
+half = "2"
 log = "0.4.29"
 nalgebra-glm = { version = "0.20.0", features = ["convert-bytemuck"] }
 web-time = "1.1.0"
@@ -30,7 +31,6 @@ pollster = "0.4.0"
 gltf = "1.4"
 ureq = "2"
 image = { version = "0.25", features = ["hdr"] }
-half = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1.7"
