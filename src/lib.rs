@@ -2231,6 +2231,8 @@ struct MeshGpu {
     bounds_buffer: wgpu::Buffer,
     cull_buffer: wgpu::Buffer,
     objects_bind_group: Option<wgpu::BindGroup>,
+    shadow_bind_group: Option<wgpu::BindGroup>,
+    point_bind_group: Option<wgpu::BindGroup>,
     cached_instances: Vec<f32>,
 }
 
@@ -2996,6 +2998,8 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
         bounds_buffer,
         cull_buffer,
         objects_bind_group: None,
+        shadow_bind_group: None,
+        point_bind_group: None,
         cached_instances: Vec::new(),
     }
 }
@@ -3090,9 +3094,11 @@ impl GeometryPass {
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             for (handle, mesh) in self.meshes.iter().enumerate() {
-                if counts[handle] > 0 {
+                if counts[handle] > 0
+                    && let Some(group) = &mesh.shadow_bind_group
+                {
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
+                    pass.set_bind_group(1, group, &[]);
                     pass.draw(0..mesh.vertex_count, 0..counts[handle]);
                 }
             }
@@ -3330,6 +3336,16 @@ impl PassNode for GeometryPass {
                     (1, mesh.visible_indices_buffer.as_entire_binding()),
                 ],
             ));
+            mesh.shadow_bind_group = Some(bind_group(
+                context.device,
+                &self.shadow_pipeline.get_bind_group_layout(1),
+                vec![(0, mesh.instance_buffer.as_entire_binding())],
+            ));
+            mesh.point_bind_group = Some(bind_group(
+                context.device,
+                &self.point_pipeline.get_bind_group_layout(1),
+                vec![(0, mesh.instance_buffer.as_entire_binding())],
+            ));
             let mut cull = context
                 .encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3426,9 +3442,11 @@ impl PassNode for GeometryPass {
                 point_pass.set_pipeline(&self.point_pipeline);
                 point_pass.set_bind_group(0, &self.point_face_bind_groups[face], &[]);
                 for (handle, mesh) in self.meshes.iter().enumerate() {
-                    if counts[handle] > 0 {
+                    if counts[handle] > 0
+                        && let Some(group) = &mesh.point_bind_group
+                    {
                         point_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                        point_pass.set_vertex_buffer(1, mesh.instance_buffer.slice(..));
+                        point_pass.set_bind_group(1, group, &[]);
                         point_pass.draw(0..mesh.vertex_count, 0..counts[handle]);
                     }
                 }
@@ -4316,21 +4334,6 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     });
     let vertex_attrs =
         wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 7 => Float32x3, 13 => Float32x2];
-    let instance_attrs = wgpu::vertex_attr_array![
-        2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 8 => Float32x4, 9 => Float32x4
-    ];
-    let mesh_buffers = [
-        wgpu::VertexBufferLayout {
-            array_stride: 44,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &vertex_attrs,
-        },
-        wgpu::VertexBufferLayout {
-            array_stride: 112,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &instance_attrs,
-        },
-    ];
     let mesh_color_buffers = [wgpu::VertexBufferLayout {
         array_stride: 44,
         step_mode: wgpu::VertexStepMode::Vertex,
@@ -4352,7 +4355,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let shadow_pipeline = render_pipeline(
         &device,
         &shadow_shader,
-        &mesh_buffers,
+        &mesh_color_buffers,
         &[],
         true,
         wgpu::CompareFunction::GreaterEqual,
@@ -4525,7 +4528,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let point_pipeline = render_pipeline(
         &device,
         &point_shader,
-        &mesh_buffers,
+        &mesh_color_buffers,
         &[Some(wgpu::TextureFormat::R16Float.into())],
         true,
         wgpu::CompareFunction::GreaterEqual,
