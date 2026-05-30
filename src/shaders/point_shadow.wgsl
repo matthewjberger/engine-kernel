@@ -15,6 +15,7 @@ struct Instance {
     visible: vec4<u32>,
 }
 @group(1) @binding(0) var<storage, read> objects: array<Instance>;
+@group(1) @binding(1) var<storage, read> visible_indices: array<u32>;
 struct VertexInput {
     @location(0) position: vec3<f32>,
 }
@@ -23,7 +24,7 @@ struct VertexOutput {
     @location(0) world_position: vec3<f32>,
 }
 @vertex fn vs(in: VertexInput, @builtin(instance_index) instance_index: u32) -> VertexOutput {
-    let object = objects[instance_index];
+    let object = objects[visible_indices[instance_index]];
     let model = mat4x4<f32>(object.model_0, object.model_1, object.model_2, object.model_3);
     let world = model * vec4<f32>(in.position, 1.0);
     return VertexOutput(face.view_projection * world, world.xyz);

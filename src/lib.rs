@@ -2347,9 +2347,12 @@ struct MeshGpu {
     bounds_buffer: wgpu::Buffer,
     cull_buffer: wgpu::Buffer,
     objects_bind_group: Option<wgpu::BindGroup>,
-    shadow_bind_group: Option<wgpu::BindGroup>,
-    point_bind_group: Option<wgpu::BindGroup>,
     cached_instances: Vec<f32>,
+    shadow_visible: Vec<wgpu::Buffer>,
+    shadow_indirect: Vec<wgpu::Buffer>,
+    shadow_cull_uniform: Vec<wgpu::Buffer>,
+    shadow_view_binds: Vec<wgpu::BindGroup>,
+    point_view_binds: Vec<wgpu::BindGroup>,
 }
 
 struct GeometryPass {
@@ -3112,9 +3115,12 @@ fn mesh_gpu(
         bounds_buffer,
         cull_buffer,
         objects_bind_group: None,
-        shadow_bind_group: None,
-        point_bind_group: None,
         cached_instances: Vec::new(),
+        shadow_visible: Vec::new(),
+        shadow_indirect: Vec::new(),
+        shadow_cull_uniform: Vec::new(),
+        shadow_view_binds: Vec::new(),
+        point_view_binds: Vec::new(),
     }
 }
 
@@ -3187,6 +3193,7 @@ impl GeometryPass {
         count: usize,
         counts: &[u32],
         skinned_draws: &[(usize, u32)],
+        base: usize,
     ) {
         for (slot, bind_group) in bind_groups.iter().take(count).enumerate() {
             let load = if slot == 0 {
@@ -3213,15 +3220,10 @@ impl GeometryPass {
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             for (handle, mesh) in self.meshes.iter().enumerate() {
-                if counts[handle] > 0
-                    && let Some(group) = &mesh.shadow_bind_group
-                {
+                if counts[handle] > 0 && base + slot < mesh.shadow_view_binds.len() {
                     pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
-                    pass.set_bind_group(1, group, &[]);
-                    pass.draw(
-                        mesh.first_vertex..mesh.first_vertex + mesh.vertex_count,
-                        0..counts[handle],
-                    );
+                    pass.set_bind_group(1, &mesh.shadow_view_binds[base + slot], &[]);
+                    pass.draw_indirect(&mesh.shadow_indirect[base + slot], 0);
                 }
             }
             for &(handle, vertex_count) in skinned_draws {
@@ -3270,6 +3272,7 @@ impl PassNode for GeometryPass {
         let (near, y_fov) = camera_near_fov(context.world);
         let splits = cascade_splits(near);
         let light_travel = -sun;
+        let mut shadow_vps: Vec<Mat4> = Vec::new();
         let mut shadow_data = [0.0f32; 92];
         for cascade in 0..4 {
             let cascade_near = if cascade == 0 {
@@ -3285,6 +3288,7 @@ impl PassNode for GeometryPass {
                 splits[cascade],
             );
             let (cascade_vp, texel_world) = cascade_view_projection(&corners, light_travel, 1024.0);
+            shadow_vps.push(cascade_vp);
             shadow_data[cascade * 16..cascade * 16 + 16].copy_from_slice(cascade_vp.as_slice());
             shadow_data[68 + cascade * 4] = (cascade % 2) as f32 * 0.5;
             shadow_data[68 + cascade * 4 + 1] = (cascade / 2) as f32 * 0.5;
@@ -3308,6 +3312,10 @@ impl PassNode for GeometryPass {
             .queue
             .write_buffer(&self.lights_buffer, 0, bytemuck::cast_slice(&lights));
 
+        let spot_view_base = shadow_vps.len();
+        for spot_vp in spot_shadows.iter() {
+            shadow_vps.push(*spot_vp);
+        }
         let mut spot_shadow_data = [0.0f32; 80];
         for (slot, spot_vp) in spot_shadows.iter().enumerate() {
             spot_shadow_data[slot * 16..slot * 16 + 16].copy_from_slice(spot_vp.as_slice());
@@ -3326,6 +3334,42 @@ impl PassNode for GeometryPass {
             0,
             bytemuck::cast_slice(&spot_shadow_data),
         );
+
+        let point_view_base = shadow_vps.len();
+        let point_light_total = lights[12] as usize;
+        let point_y_flip = Mat4::new(
+            1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        );
+        let mut point_shadow_lights: Vec<usize> = Vec::new();
+        for index in 0..point_light_total {
+            if point_shadow_lights.len() >= 4 || lights[80 + index * 4 + 3] >= -1.5 {
+                continue;
+            }
+            let point_position = nalgebra_glm::vec3(
+                lights[16 + index * 4],
+                lights[16 + index * 4 + 1],
+                lights[16 + index * 4 + 2],
+            );
+            let point_range = lights[16 + index * 4 + 3].max(0.5);
+            let projection = point_y_flip
+                * reverse_z_perspective(std::f32::consts::FRAC_PI_2, 1.0, 0.05, point_range);
+            let slot = point_shadow_lights.len();
+            for (face, (direction, up)) in CUBE_FACES.iter().enumerate() {
+                let view_projection = projection
+                    * nalgebra_glm::look_at(&point_position, &(point_position + direction), up);
+                shadow_vps.push(view_projection);
+                let mut face_data = [0.0f32; 20];
+                face_data[..16].copy_from_slice(view_projection.as_slice());
+                face_data[16..19].copy_from_slice(point_position.as_slice());
+                face_data[19] = point_range;
+                context.queue.write_buffer(
+                    &self.point_face_buffers[slot * 6 + face],
+                    0,
+                    bytemuck::cast_slice(&face_data),
+                );
+            }
+            point_shadow_lights.push(index);
+        }
 
         let screen_width = context.size.0.max(1) as f32;
         let screen_height = context.size.1.max(1) as f32;
@@ -3468,16 +3512,6 @@ impl PassNode for GeometryPass {
                     (1, mesh.visible_indices_buffer.as_entire_binding()),
                 ],
             ));
-            mesh.shadow_bind_group = Some(bind_group(
-                context.device,
-                &self.shadow_pipeline.get_bind_group_layout(1),
-                vec![(0, mesh.instance_buffer.as_entire_binding())],
-            ));
-            mesh.point_bind_group = Some(bind_group(
-                context.device,
-                &self.point_pipeline.get_bind_group_layout(1),
-                vec![(0, mesh.instance_buffer.as_entire_binding())],
-            ));
             let mut cull = context
                 .encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3487,6 +3521,96 @@ impl PassNode for GeometryPass {
             cull.set_pipeline(&self.cull_pipeline);
             cull.set_bind_group(0, &cull_bind, &[]);
             cull.dispatch_workgroups(count.div_ceil(64), 1, 1);
+            drop(cull);
+            while mesh.shadow_visible.len() < shadow_vps.len() {
+                mesh.shadow_visible
+                    .push(context.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: None,
+                        size: needed,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                mesh.shadow_indirect
+                    .push(context.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: None,
+                        size: 16,
+                        usage: wgpu::BufferUsages::INDIRECT
+                            | wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                mesh.shadow_cull_uniform
+                    .push(uniform_buffer(context.device, 112));
+            }
+            mesh.shadow_view_binds.clear();
+            mesh.point_view_binds.clear();
+            for view in 0..shadow_vps.len() {
+                if mesh.shadow_visible[view].size() < needed {
+                    mesh.shadow_visible[view] =
+                        context.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: None,
+                            size: needed,
+                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                }
+                let view_frustum = frustum_planes(&shadow_vps[view]);
+                let mut view_cull_data = [0u32; 28];
+                for (slot, value) in view_frustum.iter().enumerate() {
+                    view_cull_data[slot] = value.to_bits();
+                }
+                view_cull_data[24] = count;
+                context.queue.write_buffer(
+                    &mesh.shadow_cull_uniform[view],
+                    0,
+                    bytemuck::cast_slice(&view_cull_data),
+                );
+                context.queue.write_buffer(
+                    &mesh.shadow_indirect[view],
+                    0,
+                    bytemuck::cast_slice(&[mesh.vertex_count, 0u32, mesh.first_vertex, 0]),
+                );
+                let view_bind = bind_group(
+                    context.device,
+                    &self.cull_pipeline.get_bind_group_layout(0),
+                    vec![
+                        (0, mesh.instance_buffer.as_entire_binding()),
+                        (1, mesh.shadow_visible[view].as_entire_binding()),
+                        (2, mesh.shadow_indirect[view].as_entire_binding()),
+                        (3, mesh.bounds_buffer.as_entire_binding()),
+                        (4, mesh.shadow_cull_uniform[view].as_entire_binding()),
+                    ],
+                );
+                if view < point_view_base {
+                    mesh.shadow_view_binds.push(bind_group(
+                        context.device,
+                        &self.shadow_pipeline.get_bind_group_layout(1),
+                        vec![
+                            (0, mesh.instance_buffer.as_entire_binding()),
+                            (1, mesh.shadow_visible[view].as_entire_binding()),
+                        ],
+                    ));
+                } else {
+                    mesh.point_view_binds.push(bind_group(
+                        context.device,
+                        &self.point_pipeline.get_bind_group_layout(1),
+                        vec![
+                            (0, mesh.instance_buffer.as_entire_binding()),
+                            (1, mesh.shadow_visible[view].as_entire_binding()),
+                        ],
+                    ));
+                }
+                let mut view_cull =
+                    context
+                        .encoder
+                        .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: None,
+                            timestamp_writes: None,
+                        });
+                view_cull.set_pipeline(&self.cull_pipeline);
+                view_cull.set_bind_group(0, &view_bind, &[]);
+                view_cull.dispatch_workgroups(count.div_ceil(64), 1, 1);
+            }
         }
 
         let skinned = skinned_instances(context.world);
@@ -3543,12 +3667,18 @@ impl PassNode for GeometryPass {
             target.shadow_bind_group = Some(bind_group(
                 context.device,
                 &self.shadow_pipeline.get_bind_group_layout(1),
-                vec![(0, target.instance_buffer.as_entire_binding())],
+                vec![
+                    (0, target.instance_buffer.as_entire_binding()),
+                    (1, target.visible_indices_buffer.as_entire_binding()),
+                ],
             ));
             target.point_bind_group = Some(bind_group(
                 context.device,
                 &self.point_pipeline.get_bind_group_layout(1),
-                vec![(0, target.instance_buffer.as_entire_binding())],
+                vec![
+                    (0, target.instance_buffer.as_entire_binding()),
+                    (1, target.visible_indices_buffer.as_entire_binding()),
+                ],
             ));
             skinned_draws.push((handle, vertex_count));
         }
@@ -3593,6 +3723,7 @@ impl PassNode for GeometryPass {
             4,
             &counts,
             &skinned_draws,
+            0,
         );
         self.render_shadow_atlas(
             context.encoder,
@@ -3601,41 +3732,13 @@ impl PassNode for GeometryPass {
             spot_shadows.len(),
             &counts,
             &skinned_draws,
+            spot_view_base,
         );
 
-        let point_count = lights[12] as usize;
-        let y_flip = Mat4::new(
-            1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-        );
-        let mut shadow_slot = 0usize;
-        for index in 0..point_count {
-            if shadow_slot >= 4 || lights[80 + index * 4 + 3] >= -1.5 {
-                continue;
-            }
-            let point_position = nalgebra_glm::vec3(
-                lights[16 + index * 4],
-                lights[16 + index * 4 + 1],
-                lights[16 + index * 4 + 2],
-            );
-            let point_range = lights[16 + index * 4 + 3].max(0.5);
-            let projection =
-                y_flip * reverse_z_perspective(std::f32::consts::FRAC_PI_2, 1.0, 0.05, point_range);
-            for (face, (direction, up)) in CUBE_FACES.iter().enumerate() {
-                let target = point_position + direction;
-                let view_projection =
-                    projection * nalgebra_glm::look_at(&point_position, &target, up);
-                let mut face_data = [0.0f32; 20];
-                face_data[..16].copy_from_slice(view_projection.as_slice());
-                face_data[16..19].copy_from_slice(point_position.as_slice());
-                face_data[19] = point_range;
-                context.queue.write_buffer(
-                    &self.point_face_buffers[shadow_slot * 6 + face],
-                    0,
-                    bytemuck::cast_slice(&face_data),
-                );
-            }
+        for slot in 0..point_shadow_lights.len() {
             for face in 0..6 {
-                let layer = shadow_slot * 6 + face;
+                let layer = slot * 6 + face;
+                let view = point_view_base + layer;
                 let mut point_pass =
                     context
                         .encoder
@@ -3664,15 +3767,10 @@ impl PassNode for GeometryPass {
                 point_pass.set_pipeline(&self.point_pipeline);
                 point_pass.set_bind_group(0, &self.point_face_bind_groups[layer], &[]);
                 for (handle, mesh) in self.meshes.iter().enumerate() {
-                    if counts[handle] > 0
-                        && let Some(group) = &mesh.point_bind_group
-                    {
+                    if counts[handle] > 0 && layer < mesh.point_view_binds.len() {
                         point_pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
-                        point_pass.set_bind_group(1, group, &[]);
-                        point_pass.draw(
-                            mesh.first_vertex..mesh.first_vertex + mesh.vertex_count,
-                            0..counts[handle],
-                        );
+                        point_pass.set_bind_group(1, &mesh.point_view_binds[layer], &[]);
+                        point_pass.draw_indirect(&mesh.shadow_indirect[view], 0);
                     }
                 }
                 for &(skinned_handle, vertex_count) in &skinned_draws {
@@ -3684,7 +3782,6 @@ impl PassNode for GeometryPass {
                     }
                 }
             }
-            shadow_slot += 1;
         }
 
         let (color_view, color_load, color_store) = color_attachment(context, "color");
