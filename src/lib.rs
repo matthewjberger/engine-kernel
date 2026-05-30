@@ -2338,7 +2338,7 @@ fn render_graph_execute(
 }
 
 struct MeshGpu {
-    vertex_buffer: wgpu::Buffer,
+    first_vertex: u32,
     vertex_count: u32,
     instance_buffer: wgpu::Buffer,
     instance_capacity: u32,
@@ -2382,6 +2382,7 @@ struct GeometryPass {
     joint_buffer: wgpu::Buffer,
     joint_capacity: u32,
     cull_pipeline: wgpu::ComputePipeline,
+    mesh_vertex_buffer: wgpu::Buffer,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -3047,14 +3048,12 @@ fn frustum_planes(view_projection: &Mat4) -> [f32; 24] {
     out
 }
 
-fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> MeshGpu {
-    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: std::mem::size_of_val(vertices) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
+fn mesh_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    vertices: &[f32],
+    first_vertex: u32,
+) -> MeshGpu {
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 176,
@@ -3104,7 +3103,7 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
     );
     let cull_buffer = uniform_buffer(device, 112);
     MeshGpu {
-        vertex_buffer,
+        first_vertex,
         vertex_count: vertices.len() as u32 / 11,
         instance_buffer,
         instance_capacity: 1,
@@ -3217,9 +3216,12 @@ impl GeometryPass {
                 if counts[handle] > 0
                     && let Some(group) = &mesh.shadow_bind_group
                 {
-                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
                     pass.set_bind_group(1, group, &[]);
-                    pass.draw(0..mesh.vertex_count, 0..counts[handle]);
+                    pass.draw(
+                        mesh.first_vertex..mesh.first_vertex + mesh.vertex_count,
+                        0..counts[handle],
+                    );
                 }
             }
             for &(handle, vertex_count) in skinned_draws {
@@ -3437,7 +3439,7 @@ impl PassNode for GeometryPass {
             context.queue.write_buffer(
                 &mesh.indirect_buffer,
                 0,
-                bytemuck::cast_slice(&[mesh.vertex_count, 0u32, 0, 0]),
+                bytemuck::cast_slice(&[mesh.vertex_count, 0u32, mesh.first_vertex, 0]),
             );
             let mut cull_data = [0u32; 28];
             for (index, value) in frustum.iter().enumerate() {
@@ -3665,9 +3667,12 @@ impl PassNode for GeometryPass {
                     if counts[handle] > 0
                         && let Some(group) = &mesh.point_bind_group
                     {
-                        point_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        point_pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
                         point_pass.set_bind_group(1, group, &[]);
-                        point_pass.draw(0..mesh.vertex_count, 0..counts[handle]);
+                        point_pass.draw(
+                            mesh.first_vertex..mesh.first_vertex + mesh.vertex_count,
+                            0..counts[handle],
+                        );
                     }
                 }
                 for &(skinned_handle, vertex_count) in &skinned_draws {
@@ -3727,7 +3732,7 @@ impl PassNode for GeometryPass {
             if counts[handle] > 0
                 && let Some(group) = &mesh.objects_bind_group
             {
-                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
                 pass.set_bind_group(1, group, &[]);
                 pass.draw_indirect(&mesh.indirect_buffer, 0);
             }
@@ -4542,15 +4547,30 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let character = fetch_gltf(
         "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/CesiumMan/glTF-Binary/CesiumMan.glb",
     );
-    let mut meshes = vec![
-        mesh_gpu(&device, &queue, &with_uv(&CUBE_VERTICES)),
-        mesh_gpu(&device, &queue, &sphere_mesh(16, 32)),
-    ];
+    let mut mesh_vertices: Vec<Vec<f32>> = vec![with_uv(&CUBE_VERTICES), sphere_mesh(16, 32)];
     if let Some(ref import) = helmet {
         for primitive in &import.primitives {
-            meshes.push(mesh_gpu(&device, &queue, primitive));
+            mesh_vertices.push(primitive.clone());
         }
     }
+    let mut combined_vertices: Vec<f32> = Vec::new();
+    let mut meshes = Vec::with_capacity(mesh_vertices.len());
+    for vertices in &mesh_vertices {
+        let first_vertex = (combined_vertices.len() / 11) as u32;
+        meshes.push(mesh_gpu(&device, &queue, vertices, first_vertex));
+        combined_vertices.extend_from_slice(vertices);
+    }
+    let mesh_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: std::mem::size_of_val(combined_vertices.as_slice()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &mesh_vertex_buffer,
+        0,
+        bytemuck::cast_slice(&combined_vertices),
+    );
     let mut skinned = Vec::new();
     if let Some(ref import) = character {
         for primitive in &import.skinned_primitives {
@@ -4896,6 +4916,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             joint_buffer,
             joint_capacity: 0,
             cull_pipeline,
+            mesh_vertex_buffer,
             camera_buffer,
             lights_buffer,
             bind_group: geometry_bind_group,
