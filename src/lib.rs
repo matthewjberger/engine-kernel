@@ -2399,7 +2399,7 @@ fn upload_instances(
         *capacity = count.next_power_of_two();
         *buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: *capacity as u64 * 112,
+            size: *capacity as u64 * 176,
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST,
@@ -2424,7 +2424,7 @@ fn upload_instances_diff(
         *capacity = count.next_power_of_two();
         *buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: *capacity as u64 * 112,
+            size: *capacity as u64 * 176,
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST,
@@ -2446,8 +2446,8 @@ fn upload_instances_diff(
     let mut changed = 0usize;
     let mut open: Option<(usize, usize)> = None;
     for (record, (new, old)) in data
-        .chunks_exact(28)
-        .zip(cached.chunks_exact(28))
+        .chunks_exact(44)
+        .zip(cached.chunks_exact(44))
         .enumerate()
     {
         if new != old {
@@ -2469,8 +2469,8 @@ fn upload_instances_diff(
         for (start, end) in ranges {
             queue.write_buffer(
                 buffer,
-                start as u64 * 112,
-                bytemuck::cast_slice(&data[start * 28..end * 28]),
+                start as u64 * 176,
+                bytemuck::cast_slice(&data[start * 44..end * 44]),
             );
         }
     }
@@ -3057,7 +3057,7 @@ fn mesh_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[f32]) -> Mes
     queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 112,
+        size: 176,
         usage: wgpu::BufferUsages::VERTEX
             | wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST,
@@ -3152,7 +3152,7 @@ fn skinned_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[u32]) -> 
     let params_buffer = uniform_buffer(device, 16);
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 112,
+        size: 176,
         usage: wgpu::BufferUsages::VERTEX
             | wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST,
@@ -3394,9 +3394,10 @@ impl PassNode for GeometryPass {
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
             let instances = mesh_instances(context.world, handle as u32);
             let count = instances.len() as u32;
-            let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 28);
+            let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 44);
             for (model, emissive, material) in &instances {
                 data.extend_from_slice(model.as_slice());
+                data.extend_from_slice(&[0.0; 12]);
                 data.extend_from_slice(&[emissive.x, emissive.y, emissive.z, material.roughness]);
                 data.extend_from_slice(&[
                     material.albedo.x,
@@ -3408,6 +3409,7 @@ impl PassNode for GeometryPass {
                 data.push(material.normal_layer as f32);
                 data.push(material.orm_layer as f32);
                 data.push(material.emissive_layer as f32);
+                data.extend_from_slice(&[f32::from_bits(1), 0.0, 0.0, 0.0]);
             }
             upload_instances_diff(
                 context.device,
@@ -3503,8 +3505,10 @@ impl PassNode for GeometryPass {
                 0,
                 bytemuck::cast_slice(&[vertex_count, joint_offset, 0, 0]),
             );
-            let mut instance: Vec<f32> = Vec::with_capacity(28);
+            let mut instance: Vec<f32> = Vec::with_capacity(44);
             instance.extend_from_slice(Mat4::identity().as_slice());
+            instance
+                .extend_from_slice(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
             instance.extend_from_slice(&[emissive.x, emissive.y, emissive.z, material.roughness]);
             instance.extend_from_slice(&[
                 material.albedo.x,
@@ -3516,6 +3520,7 @@ impl PassNode for GeometryPass {
             instance.push(material.normal_layer as f32);
             instance.push(material.orm_layer as f32);
             instance.push(material.emissive_layer as f32);
+            instance.extend_from_slice(&[f32::from_bits(1), 0.0, 0.0, 0.0]);
             let target = &mut self.skinned[handle];
             upload_instances(
                 context.device,

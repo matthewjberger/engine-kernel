@@ -295,9 +295,11 @@ struct Instance {
     model_1: vec4<f32>,
     model_2: vec4<f32>,
     model_3: vec4<f32>,
+    normal_matrix: mat3x3<f32>,
     emissive: vec4<f32>,
     albedo_metallic: vec4<f32>,
     layers: vec4<f32>,
+    visible: vec4<u32>,
 }
 @group(1) @binding(0) var<storage, read> objects: array<Instance>;
 @group(1) @binding(1) var<storage, read> visible_indices: array<u32>;
@@ -425,7 +427,7 @@ fn lighting(
     let model = mat4x4<f32>(object.model_0, object.model_1, object.model_2, object.model_3);
     let world = model * vec4<f32>(in.position, 1.0);
     let clip = camera.view_projection * world;
-    let world_normal = (model * vec4<f32>(in.normal, 0.0)).xyz;
+    let world_normal = object.normal_matrix * in.normal;
     let view_normal = (camera.view * vec4<f32>(world_normal, 0.0)).xyz;
     let model_scale = vec3<f32>(length(model[0].xyz), length(model[1].xyz), length(model[2].xyz));
     return VertexOutput(

@@ -4,9 +4,11 @@ struct Instance {
     model_1: vec4<f32>,
     model_2: vec4<f32>,
     model_3: vec4<f32>,
+    normal_matrix: mat3x3<f32>,
     emissive: vec4<f32>,
     albedo_metallic: vec4<f32>,
     layers: vec4<f32>,
+    visible: vec4<u32>,
 }
 @group(1) @binding(0) var<storage, read> objects: array<Instance>;
 struct VertexInput {
