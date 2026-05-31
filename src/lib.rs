@@ -1844,6 +1844,8 @@ const BRDF_LUT_SHADER: &str = include_str!("shaders/brdf_lut.wgsl");
 
 const SKIN_COMPUTE_SHADER: &str = include_str!("shaders/skin_compute.wgsl");
 
+const SKINNED_CULL_SHADER: &str = include_str!("shaders/skinned_cull.wgsl");
+
 const HIZ_COPY_SHADER: &str = include_str!("shaders/hiz_copy.wgsl");
 
 const HIZ_DOWNSAMPLE_SHADER: &str = include_str!("shaders/hiz_downsample.wgsl");
@@ -2352,6 +2354,7 @@ struct GeometryPass {
     meshes: Vec<MeshGpu>,
     skinned: Vec<SkinnedGpu>,
     skin_pipeline: wgpu::ComputePipeline,
+    skinned_cull_pipeline: wgpu::ComputePipeline,
     joint_buffer: wgpu::Buffer,
     joint_capacity: u32,
     mesh_vertex_buffer: wgpu::Buffer,
@@ -3118,16 +3121,70 @@ struct SkinnedGpu {
     output_buffer: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
     vertex_count: u32,
+    radius: f32,
     instance_buffer: wgpu::Buffer,
     instance_capacity: u32,
     visible_indices_buffer: wgpu::Buffer,
     objects_bind_group: Option<wgpu::BindGroup>,
     shadow_bind_group: Option<wgpu::BindGroup>,
     point_bind_group: Option<wgpu::BindGroup>,
+    color_indirect: wgpu::Buffer,
+    color_cull_uniform: wgpu::Buffer,
+    shadow_indirect: Vec<wgpu::Buffer>,
+    shadow_cull_uniform: Vec<wgpu::Buffer>,
+}
+
+fn skinned_world_sphere(matrices: &[Mat4], margin: f32) -> [f32; 4] {
+    if matrices.is_empty() {
+        return [0.0, 0.0, 0.0, 1.0e9];
+    }
+    let mut centroid = Vec3::zeros();
+    for matrix in matrices {
+        centroid += nalgebra_glm::vec3(matrix[(0, 3)], matrix[(1, 3)], matrix[(2, 3)]);
+    }
+    centroid /= matrices.len() as f32;
+    let mut max_distance_squared = 0.0f32;
+    for matrix in matrices {
+        let position = nalgebra_glm::vec3(matrix[(0, 3)], matrix[(1, 3)], matrix[(2, 3)]);
+        max_distance_squared = max_distance_squared.max((position - centroid).norm_squared());
+    }
+    [
+        centroid.x,
+        centroid.y,
+        centroid.z,
+        max_distance_squared.sqrt() + margin,
+    ]
+}
+
+fn write_skinned_cull(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    frustum: &[f32; 24],
+    sphere: [f32; 4],
+    vertex_count: u32,
+) {
+    let mut data = [0u32; 32];
+    for (index, value) in frustum.iter().enumerate() {
+        data[index] = value.to_bits();
+    }
+    for (index, value) in sphere.iter().enumerate() {
+        data[24 + index] = value.to_bits();
+    }
+    data[28] = vertex_count;
+    queue.write_buffer(buffer, 0, bytemuck::cast_slice(&data));
 }
 
 fn skinned_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[u32]) -> SkinnedGpu {
     let vertex_count = vertices.len() as u32 / 16;
+    let mut radius = 0.0f32;
+    for vertex in vertices.chunks_exact(16) {
+        let position = nalgebra_glm::vec3(
+            f32::from_bits(vertex[0]),
+            f32::from_bits(vertex[1]),
+            f32::from_bits(vertex[2]),
+        );
+        radius = radius.max(position.norm());
+    }
     let rest_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: std::mem::size_of_val(vertices).max(16) as u64,
@@ -3159,17 +3216,31 @@ fn skinned_gpu(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[u32]) -> 
         mapped_at_creation: false,
     });
     queue.write_buffer(&visible_indices_buffer, 0, bytemuck::cast_slice(&[0u32]));
+    let color_indirect = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 16,
+        usage: wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let color_cull_uniform = uniform_buffer(device, 128);
     SkinnedGpu {
         rest_buffer,
         output_buffer,
         params_buffer,
         vertex_count,
+        radius,
         instance_buffer,
         instance_capacity: 1,
         visible_indices_buffer,
         objects_bind_group: None,
         shadow_bind_group: None,
         point_bind_group: None,
+        color_indirect,
+        color_cull_uniform,
+        shadow_indirect: Vec::new(),
+        shadow_cull_uniform: Vec::new(),
     }
 }
 
@@ -3218,12 +3289,14 @@ impl GeometryPass {
                     self.batch_count,
                 );
             }
-            for &(handle, vertex_count) in skinned_draws {
+            for &(handle, _) in skinned_draws {
                 let skinned = &self.skinned[handle];
-                if let Some(group) = &skinned.shadow_bind_group {
+                if let Some(group) = &skinned.shadow_bind_group
+                    && view_index < skinned.shadow_indirect.len()
+                {
                     pass.set_vertex_buffer(0, skinned.output_buffer.slice(..));
                     pass.set_bind_group(1, group, &[]);
-                    pass.draw(0..vertex_count, 0..1);
+                    pass.draw_indirect(&skinned.shadow_indirect[view_index], 0);
                 }
             }
         }
@@ -3903,6 +3976,7 @@ impl PassNode for GeometryPass {
         let skinned = skinned_instances(context.world);
         let mut joint_data: Vec<f32> = Vec::new();
         let mut skinned_draws: Vec<(usize, u32)> = Vec::new();
+        let mut skinned_spheres: Vec<[f32; 4]> = Vec::new();
         for (handle, matrices, emissive, material) in &skinned {
             let handle = *handle as usize;
             if handle >= self.skinned.len() {
@@ -3913,6 +3987,7 @@ impl PassNode for GeometryPass {
                 joint_data.extend_from_slice(matrix.as_slice());
             }
             let vertex_count = self.skinned[handle].vertex_count;
+            let sphere = skinned_world_sphere(matrices, self.skinned[handle].radius);
             context.queue.write_buffer(
                 &self.skinned[handle].params_buffer,
                 0,
@@ -3968,6 +4043,7 @@ impl PassNode for GeometryPass {
                 ],
             ));
             skinned_draws.push((handle, vertex_count));
+            skinned_spheres.push(sphere);
         }
         if !joint_data.is_empty() {
             let needed = joint_data.len() as u32;
@@ -4000,6 +4076,85 @@ impl PassNode for GeometryPass {
                 compute.set_pipeline(&self.skin_pipeline);
                 compute.set_bind_group(0, &bind, &[]);
                 compute.dispatch_workgroups(vertex_count.div_ceil(64), 1, 1);
+            }
+        }
+
+        for (draw_index, &(handle, vertex_count)) in skinned_draws.iter().enumerate() {
+            let sphere = skinned_spheres[draw_index];
+            while self.skinned[handle].shadow_indirect.len() < shadow_vps.len() {
+                let indirect = context.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: 16,
+                    usage: wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.skinned[handle].shadow_indirect.push(indirect);
+                self.skinned[handle]
+                    .shadow_cull_uniform
+                    .push(uniform_buffer(context.device, 128));
+            }
+            write_skinned_cull(
+                context.queue,
+                &self.skinned[handle].color_cull_uniform,
+                &frustum,
+                sphere,
+                vertex_count,
+            );
+            let color_cull_bind = bind_group(
+                context.device,
+                &self.skinned_cull_pipeline.get_bind_group_layout(0),
+                vec![
+                    (0, self.skinned[handle].color_indirect.as_entire_binding()),
+                    (
+                        1,
+                        self.skinned[handle].color_cull_uniform.as_entire_binding(),
+                    ),
+                ],
+            );
+            let mut cull = context
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+            cull.set_pipeline(&self.skinned_cull_pipeline);
+            cull.set_bind_group(0, &color_cull_bind, &[]);
+            cull.dispatch_workgroups(1, 1, 1);
+            drop(cull);
+            for (view, shadow_vp) in shadow_vps.iter().enumerate() {
+                write_skinned_cull(
+                    context.queue,
+                    &self.skinned[handle].shadow_cull_uniform[view],
+                    &frustum_planes(shadow_vp),
+                    sphere,
+                    vertex_count,
+                );
+                let view_cull_bind = bind_group(
+                    context.device,
+                    &self.skinned_cull_pipeline.get_bind_group_layout(0),
+                    vec![
+                        (
+                            0,
+                            self.skinned[handle].shadow_indirect[view].as_entire_binding(),
+                        ),
+                        (
+                            1,
+                            self.skinned[handle].shadow_cull_uniform[view].as_entire_binding(),
+                        ),
+                    ],
+                );
+                let mut view_cull =
+                    context
+                        .encoder
+                        .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: None,
+                            timestamp_writes: None,
+                        });
+                view_cull.set_pipeline(&self.skinned_cull_pipeline);
+                view_cull.set_bind_group(0, &view_cull_bind, &[]);
+                view_cull.dispatch_workgroups(1, 1, 1);
             }
         }
 
@@ -4060,12 +4215,14 @@ impl PassNode for GeometryPass {
                         self.batch_count,
                     );
                 }
-                for &(skinned_handle, vertex_count) in &skinned_draws {
+                for &(skinned_handle, _) in &skinned_draws {
                     let skinned = &self.skinned[skinned_handle];
-                    if let Some(group) = &skinned.point_bind_group {
+                    if let Some(group) = &skinned.point_bind_group
+                        && view < skinned.shadow_indirect.len()
+                    {
                         point_pass.set_vertex_buffer(0, skinned.output_buffer.slice(..));
                         point_pass.set_bind_group(1, group, &[]);
-                        point_pass.draw(0..vertex_count, 0..1);
+                        point_pass.draw_indirect(&skinned.shadow_indirect[view], 0);
                     }
                 }
             }
@@ -4186,12 +4343,12 @@ impl PassNode for GeometryPass {
                 self.batch_count,
             );
         }
-        for &(handle, vertex_count) in &skinned_draws {
+        for &(handle, _) in &skinned_draws {
             let skinned = &self.skinned[handle];
             if let Some(group) = &skinned.objects_bind_group {
                 pass.set_vertex_buffer(0, skinned.output_buffer.slice(..));
                 pass.set_bind_group(1, group, &[]);
-                pass.draw(0..vertex_count, 0..1);
+                pass.draw_indirect(&skinned.color_indirect, 0);
             }
         }
         drop(pass);
@@ -5727,6 +5884,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let ssr = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let ldr = add_color_resource(&mut graph, false, SCENE_FORMAT, background);
     let skin_pipeline = compute_pipeline(&device, SKIN_COMPUTE_SHADER);
+    let skinned_cull_pipeline = compute_pipeline(&device, SKINNED_CULL_SHADER);
     let hiz_copy_pipeline = compute_pipeline(&device, HIZ_COPY_SHADER);
     let hiz_downsample_pipeline = compute_pipeline(&device, HIZ_DOWNSAMPLE_SHADER);
     let (hiz_texture, hiz_storage_views, hiz_mip_views, hiz_sample_view, hiz_params, hiz_mip_count) =
@@ -5848,6 +6006,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             meshes,
             skinned,
             skin_pipeline,
+            skinned_cull_pipeline,
             joint_buffer,
             joint_capacity: 0,
             mesh_vertex_buffer,
