@@ -2385,6 +2385,12 @@ struct GeometryPass {
     build_params_buffer: wgpu::Buffer,
     compact_params_buffer: wgpu::Buffer,
     unified_cull_buffer: wgpu::Buffer,
+    depth_prepass_pipeline: wgpu::RenderPipeline,
+    prepass_camera_bind_group: wgpu::BindGroup,
+    frustum_visible_buffer: wgpu::Buffer,
+    frustum_indirect_buffer: wgpu::Buffer,
+    frustum_count_buffer: wgpu::Buffer,
+    frustum_cull_buffer: wgpu::Buffer,
     batch_count: u32,
     shadow_visible: Vec<wgpu::Buffer>,
     shadow_indirect: Vec<wgpu::Buffer>,
@@ -3672,6 +3678,93 @@ impl PassNode for GeometryPass {
             compact.dispatch_workgroups(1, 1, 1);
         }
 
+        let occlusion_active = self.hiz_ready && context.world.resources.hiz_enabled;
+        if occlusion_active {
+            if self.frustum_visible_buffer.size() < visible_needed {
+                self.frustum_visible_buffer =
+                    context.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: None,
+                        size: visible_needed,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+            }
+            write_cull_uniform(
+                context.queue,
+                &self.frustum_cull_buffer,
+                &frustum,
+                &self.prev_view_projection,
+                (context.size.0 as f32, context.size.1 as f32),
+                total_slots,
+                self.hiz_mip_count,
+                false,
+            );
+            let frustum_build_bind = bind_group(
+                context.device,
+                &self.build_pipeline.get_bind_group_layout(0),
+                vec![
+                    (0, self.frustum_indirect_buffer.as_entire_binding()),
+                    (1, self.batch_desc_buffer.as_entire_binding()),
+                    (2, self.build_params_buffer.as_entire_binding()),
+                ],
+            );
+            let frustum_cull_bind = bind_group(
+                context.device,
+                &self.unified_cull_pipeline.get_bind_group_layout(0),
+                vec![
+                    (0, self.object_buffer.as_entire_binding()),
+                    (1, self.frustum_visible_buffer.as_entire_binding()),
+                    (2, self.frustum_indirect_buffer.as_entire_binding()),
+                    (3, self.bounds_buffer.as_entire_binding()),
+                    (4, self.frustum_cull_buffer.as_entire_binding()),
+                    (5, wgpu::BindingResource::TextureView(&self.hiz_sample_view)),
+                ],
+            );
+            let frustum_compact_bind = bind_group(
+                context.device,
+                &self.compact_pipeline.get_bind_group_layout(0),
+                vec![
+                    (0, self.frustum_indirect_buffer.as_entire_binding()),
+                    (1, self.frustum_count_buffer.as_entire_binding()),
+                    (2, self.compact_params_buffer.as_entire_binding()),
+                ],
+            );
+            {
+                let mut build = context
+                    .encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                build.set_pipeline(&self.build_pipeline);
+                build.set_bind_group(0, &frustum_build_bind, &[]);
+                build.dispatch_workgroups(1, 1, 1);
+            }
+            {
+                let mut cull = context
+                    .encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                cull.set_pipeline(&self.unified_cull_pipeline);
+                cull.set_bind_group(0, &frustum_cull_bind, &[]);
+                cull.dispatch_workgroups(total_slots.div_ceil(64).max(1), 1, 1);
+            }
+            {
+                let mut compact =
+                    context
+                        .encoder
+                        .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: None,
+                            timestamp_writes: None,
+                        });
+                compact.set_pipeline(&self.compact_pipeline);
+                compact.set_bind_group(0, &frustum_compact_bind, &[]);
+                compact.dispatch_workgroups(1, 1, 1);
+            }
+        }
+
         while self.shadow_visible.len() < shadow_vps.len() {
             self.shadow_visible
                 .push(context.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3998,6 +4091,47 @@ impl PassNode for GeometryPass {
         let (color_view, color_load, color_store) = color_attachment(context, "color");
         let (normal_view, normal_load, normal_store) = color_attachment(context, "normals");
         let (depth_view, depth_load, depth_store) = depth_attachment(context, "depth");
+        let run_prepass = occlusion_active && self.batch_count > 0;
+        if run_prepass {
+            let prepass_objects_bind = bind_group(
+                context.device,
+                &self.depth_prepass_pipeline.get_bind_group_layout(1),
+                vec![
+                    (0, self.object_buffer.as_entire_binding()),
+                    (1, self.frustum_visible_buffer.as_entire_binding()),
+                ],
+            );
+            let mut prepass = context
+                .encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: depth_load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+            prepass.set_pipeline(&self.depth_prepass_pipeline);
+            prepass.set_bind_group(0, &self.prepass_camera_bind_group, &[]);
+            prepass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
+            prepass.set_bind_group(1, &prepass_objects_bind, &[]);
+            prepass.multi_draw_indirect_count(
+                &self.frustum_indirect_buffer,
+                0,
+                &self.frustum_count_buffer,
+                0,
+                self.batch_count,
+            );
+        }
+        let color_depth_load = if run_prepass {
+            wgpu::LoadOp::Load
+        } else {
+            depth_load
+        };
         let mut pass = context
             .encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -4024,7 +4158,7 @@ impl PassNode for GeometryPass {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: depth_load,
+                        load: color_depth_load,
                         store: depth_store,
                     }),
                     stencil_ops: None,
@@ -5058,7 +5192,15 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         &mesh_color_buffers,
         &[Some(SCENE_FORMAT.into()), Some(SCENE_FORMAT.into())],
         true,
-        wgpu::CompareFunction::Greater,
+        wgpu::CompareFunction::GreaterEqual,
+    );
+    let depth_prepass_pipeline = render_pipeline(
+        &device,
+        &shader,
+        &mesh_color_buffers,
+        &[],
+        true,
+        wgpu::CompareFunction::GreaterEqual,
     );
 
     let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -5648,6 +5790,34 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         bytemuck::cast_slice(&[batch_count, 0u32, 0, 0]),
     );
     let unified_cull_buffer = uniform_buffer(&device, 192);
+    let frustum_visible_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let frustum_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (batch_count as u64 * 16).max(16),
+        usage: wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let frustum_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 4,
+        usage: wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let frustum_cull_buffer = uniform_buffer(&device, 192);
+    let prepass_camera_bind_group = bind_group(
+        &device,
+        &depth_prepass_pipeline.get_bind_group_layout(0),
+        vec![(0, camera_buffer.as_entire_binding())],
+    );
     let joint_buffer = storage_buffer(&device, 64);
     add_pass(
         &mut graph,
@@ -5711,6 +5881,12 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             build_params_buffer,
             compact_params_buffer,
             unified_cull_buffer,
+            depth_prepass_pipeline,
+            prepass_camera_bind_group,
+            frustum_visible_buffer,
+            frustum_indirect_buffer,
+            frustum_count_buffer,
+            frustum_cull_buffer,
             batch_count,
             shadow_visible: Vec::new(),
             shadow_indirect: Vec::new(),
