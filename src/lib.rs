@@ -1878,6 +1878,12 @@ const HIZ_COPY_SHADER: &str = include_str!("shaders/hiz_copy.wgsl");
 
 const HIZ_DOWNSAMPLE_SHADER: &str = include_str!("shaders/hiz_downsample.wgsl");
 
+const MESH_CULL_UNIFIED_SHADER: &str = include_str!("shaders/mesh_cull_unified.wgsl");
+
+const MESH_INDIRECT_BUILD_SHADER: &str = include_str!("shaders/mesh_indirect_build.wgsl");
+
+const MESH_INDIRECT_COMPACT_SHADER: &str = include_str!("shaders/mesh_indirect_compact.wgsl");
+
 const SHADER: &str = include_str!("shaders/mesh.wgsl");
 
 const SKY_SHADER: &str = include_str!("shaders/sky.wgsl");
@@ -2347,17 +2353,15 @@ struct MeshGpu {
     vertex_count: u32,
     instance_buffer: wgpu::Buffer,
     instance_capacity: u32,
-    visible_indices_buffer: wgpu::Buffer,
-    indirect_buffer: wgpu::Buffer,
     bounds_buffer: wgpu::Buffer,
-    cull_buffer: wgpu::Buffer,
-    objects_bind_group: Option<wgpu::BindGroup>,
     cached_instances: Vec<f32>,
     shadow_visible: Vec<wgpu::Buffer>,
     shadow_indirect: Vec<wgpu::Buffer>,
     shadow_cull_uniform: Vec<wgpu::Buffer>,
     shadow_view_binds: Vec<wgpu::BindGroup>,
     point_view_binds: Vec<wgpu::BindGroup>,
+    center: Vec3,
+    radius: f32,
 }
 
 struct GeometryPass {
@@ -2402,6 +2406,21 @@ struct GeometryPass {
     hiz_mip_count: u32,
     hiz_ready: bool,
     prev_view_projection: Mat4,
+    unified_cull_pipeline: wgpu::ComputePipeline,
+    build_pipeline: wgpu::ComputePipeline,
+    compact_pipeline: wgpu::ComputePipeline,
+    object_buffer: wgpu::Buffer,
+    object_capacity: u32,
+    cached_objects: Vec<f32>,
+    visible_indices_buffer: wgpu::Buffer,
+    indirect_buffer: wgpu::Buffer,
+    bounds_buffer: wgpu::Buffer,
+    batch_desc_buffer: wgpu::Buffer,
+    count_buffer: wgpu::Buffer,
+    build_params_buffer: wgpu::Buffer,
+    compact_params_buffer: wgpu::Buffer,
+    unified_cull_buffer: wgpu::Buffer,
+    batch_count: u32,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -3167,20 +3186,6 @@ fn mesh_gpu(
             | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let visible_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 16,
-        usage: wgpu::BufferUsages::INDIRECT
-            | wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
     let mut minimum = [f32::MAX; 3];
     let mut maximum = [f32::MIN; 3];
     for vertex in vertices.chunks_exact(11) {
@@ -3206,23 +3211,20 @@ fn mesh_gpu(
         0,
         bytemuck::cast_slice(&[center.x, center.y, center.z, radius]),
     );
-    let cull_buffer = uniform_buffer(device, 192);
     MeshGpu {
         first_vertex,
         vertex_count: vertices.len() as u32 / 11,
         instance_buffer,
         instance_capacity: 1,
-        visible_indices_buffer,
-        indirect_buffer,
         bounds_buffer,
-        cull_buffer,
-        objects_bind_group: None,
         cached_instances: Vec::new(),
         shadow_visible: Vec::new(),
         shadow_indirect: Vec::new(),
         shadow_cull_uniform: Vec::new(),
         shadow_view_binds: Vec::new(),
         point_view_binds: Vec::new(),
+        center,
+        radius,
     }
 }
 
@@ -3292,12 +3294,11 @@ impl GeometryPass {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         bind_groups: &[wgpu::BindGroup],
-        count: usize,
         counts: &[u32],
         skinned_draws: &[(usize, u32)],
         base: usize,
     ) {
-        for (slot, bind_group) in bind_groups.iter().take(count).enumerate() {
+        for (slot, bind_group) in bind_groups.iter().enumerate() {
             let load = if slot == 0 {
                 wgpu::LoadOp::Clear(0.0)
             } else {
@@ -3538,6 +3539,8 @@ impl PassNode for GeometryPass {
             .unwrap_or_else(Mat4::identity);
         let frustum = frustum_planes(&current_view_projection);
         let mut counts = Vec::with_capacity(self.meshes.len());
+        let mut object_data: Vec<f32> = Vec::new();
+        let mut batch_descs: Vec<u32> = Vec::with_capacity(self.meshes.len() * 4);
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
             let instances = mesh_instances(context.world, handle as u32);
             let count = instances.len() as u32;
@@ -3556,7 +3559,12 @@ impl PassNode for GeometryPass {
                 data.push(material.normal_layer as f32);
                 data.push(material.orm_layer as f32);
                 data.push(material.emissive_layer as f32);
-                data.extend_from_slice(&[f32::from_bits(1), 0.0, 0.0, 0.0]);
+                data.extend_from_slice(&[
+                    f32::from_bits(1),
+                    f32::from_bits(handle as u32),
+                    0.0,
+                    0.0,
+                ]);
             }
             upload_instances_diff(
                 context.device,
@@ -3568,64 +3576,12 @@ impl PassNode for GeometryPass {
                 count,
             );
             counts.push(count);
+            batch_descs.extend_from_slice(&[mesh.vertex_count, mesh.first_vertex, count, 0]);
+            object_data.extend_from_slice(&data);
             if count == 0 {
                 continue;
             }
             let needed = mesh.instance_capacity as u64 * 4;
-            if mesh.visible_indices_buffer.size() < needed {
-                mesh.visible_indices_buffer =
-                    context.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: None,
-                        size: needed,
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-            }
-            context.queue.write_buffer(
-                &mesh.indirect_buffer,
-                0,
-                bytemuck::cast_slice(&[mesh.vertex_count, 0u32, mesh.first_vertex, 0]),
-            );
-            write_cull_uniform(
-                context.queue,
-                &mesh.cull_buffer,
-                &frustum,
-                &self.prev_view_projection,
-                (context.size.0 as f32, context.size.1 as f32),
-                count,
-                self.hiz_mip_count,
-                self.hiz_ready && context.world.resources.hiz_enabled,
-            );
-            let cull_bind = bind_group(
-                context.device,
-                &self.cull_pipeline.get_bind_group_layout(0),
-                vec![
-                    (0, mesh.instance_buffer.as_entire_binding()),
-                    (1, mesh.visible_indices_buffer.as_entire_binding()),
-                    (2, mesh.indirect_buffer.as_entire_binding()),
-                    (3, mesh.bounds_buffer.as_entire_binding()),
-                    (4, mesh.cull_buffer.as_entire_binding()),
-                    (5, wgpu::BindingResource::TextureView(&self.hiz_sample_view)),
-                ],
-            );
-            mesh.objects_bind_group = Some(bind_group(
-                context.device,
-                &self.pipeline.get_bind_group_layout(1),
-                vec![
-                    (0, mesh.instance_buffer.as_entire_binding()),
-                    (1, mesh.visible_indices_buffer.as_entire_binding()),
-                ],
-            ));
-            let mut cull = context
-                .encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: None,
-                    timestamp_writes: None,
-                });
-            cull.set_pipeline(&self.cull_pipeline);
-            cull.set_bind_group(0, &cull_bind, &[]);
-            cull.dispatch_workgroups(count.div_ceil(64), 1, 1);
-            drop(cull);
             while mesh.shadow_visible.len() < shadow_vps.len() {
                 mesh.shadow_visible
                     .push(context.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3648,7 +3604,7 @@ impl PassNode for GeometryPass {
             }
             mesh.shadow_view_binds.clear();
             mesh.point_view_binds.clear();
-            for view in 0..shadow_vps.len() {
+            for (view, shadow_vp) in shadow_vps.iter().enumerate() {
                 if mesh.shadow_visible[view].size() < needed {
                     mesh.shadow_visible[view] =
                         context.device.create_buffer(&wgpu::BufferDescriptor {
@@ -3658,7 +3614,7 @@ impl PassNode for GeometryPass {
                             mapped_at_creation: false,
                         });
                 }
-                let view_frustum = frustum_planes(&shadow_vps[view]);
+                let view_frustum = frustum_planes(shadow_vp);
                 write_cull_uniform(
                     context.queue,
                     &mesh.shadow_cull_uniform[view],
@@ -3716,6 +3672,105 @@ impl PassNode for GeometryPass {
                 view_cull.set_bind_group(0, &view_bind, &[]);
                 view_cull.dispatch_workgroups(count.div_ceil(64), 1, 1);
             }
+        }
+
+        let total_objects = (object_data.len() / 44) as u32;
+        upload_instances_diff(
+            context.device,
+            context.queue,
+            &mut self.object_buffer,
+            &mut self.object_capacity,
+            &mut self.cached_objects,
+            &object_data,
+            total_objects,
+        );
+        let visible_needed = (total_objects as u64 * 4).max(4);
+        if self.visible_indices_buffer.size() < visible_needed {
+            self.visible_indices_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: visible_needed,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        context.queue.write_buffer(
+            &self.batch_desc_buffer,
+            0,
+            bytemuck::cast_slice(&batch_descs),
+        );
+        write_cull_uniform(
+            context.queue,
+            &self.unified_cull_buffer,
+            &frustum,
+            &self.prev_view_projection,
+            (context.size.0 as f32, context.size.1 as f32),
+            total_objects,
+            self.hiz_mip_count,
+            self.hiz_ready && context.world.resources.hiz_enabled,
+        );
+        let build_bind = bind_group(
+            context.device,
+            &self.build_pipeline.get_bind_group_layout(0),
+            vec![
+                (0, self.indirect_buffer.as_entire_binding()),
+                (1, self.batch_desc_buffer.as_entire_binding()),
+                (2, self.build_params_buffer.as_entire_binding()),
+            ],
+        );
+        let unified_cull_bind = bind_group(
+            context.device,
+            &self.unified_cull_pipeline.get_bind_group_layout(0),
+            vec![
+                (0, self.object_buffer.as_entire_binding()),
+                (1, self.visible_indices_buffer.as_entire_binding()),
+                (2, self.indirect_buffer.as_entire_binding()),
+                (3, self.bounds_buffer.as_entire_binding()),
+                (4, self.unified_cull_buffer.as_entire_binding()),
+                (5, wgpu::BindingResource::TextureView(&self.hiz_sample_view)),
+            ],
+        );
+        let compact_bind = bind_group(
+            context.device,
+            &self.compact_pipeline.get_bind_group_layout(0),
+            vec![
+                (0, self.indirect_buffer.as_entire_binding()),
+                (1, self.count_buffer.as_entire_binding()),
+                (2, self.compact_params_buffer.as_entire_binding()),
+            ],
+        );
+        {
+            let mut build = context
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+            build.set_pipeline(&self.build_pipeline);
+            build.set_bind_group(0, &build_bind, &[]);
+            build.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut unified_cull =
+                context
+                    .encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+            unified_cull.set_pipeline(&self.unified_cull_pipeline);
+            unified_cull.set_bind_group(0, &unified_cull_bind, &[]);
+            unified_cull.dispatch_workgroups(total_objects.div_ceil(64).max(1), 1, 1);
+        }
+        {
+            let mut compact = context
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+            compact.set_pipeline(&self.compact_pipeline);
+            compact.set_bind_group(0, &compact_bind, &[]);
+            compact.dispatch_workgroups(1, 1, 1);
         }
 
         let skinned = skinned_instances(context.world);
@@ -3824,8 +3879,7 @@ impl PassNode for GeometryPass {
         self.render_shadow_atlas(
             context.encoder,
             &self.shadow_view,
-            &self.cascade_bind_groups,
-            4,
+            &self.cascade_bind_groups[..4],
             &counts,
             &skinned_draws,
             0,
@@ -3833,8 +3887,7 @@ impl PassNode for GeometryPass {
         self.render_shadow_atlas(
             context.encoder,
             &self.spot_atlas_view,
-            &self.spot_bind_groups,
-            spot_shadows.len(),
+            &self.spot_bind_groups[..spot_shadows.len()],
             &counts,
             &skinned_draws,
             spot_view_base,
@@ -3889,6 +3942,14 @@ impl PassNode for GeometryPass {
             }
         }
 
+        let unified_objects_bind = bind_group(
+            context.device,
+            &self.pipeline.get_bind_group_layout(1),
+            vec![
+                (0, self.object_buffer.as_entire_binding()),
+                (1, self.visible_indices_buffer.as_entire_binding()),
+            ],
+        );
         let (color_view, color_load, color_store) = color_attachment(context, "color");
         let (normal_view, normal_load, normal_store) = color_attachment(context, "normals");
         let (depth_view, depth_load, depth_store) = depth_attachment(context, "depth");
@@ -3930,14 +3991,16 @@ impl PassNode for GeometryPass {
         pass.draw(0..3, 0..1);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        for (handle, mesh) in self.meshes.iter().enumerate() {
-            if counts[handle] > 0
-                && let Some(group) = &mesh.objects_bind_group
-            {
-                pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
-                pass.set_bind_group(1, group, &[]);
-                pass.draw_indirect(&mesh.indirect_buffer, 0);
-            }
+        if self.batch_count > 0 {
+            pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
+            pass.set_bind_group(1, &unified_objects_bind, &[]);
+            pass.multi_draw_indirect_count(
+                &self.indirect_buffer,
+                0,
+                &self.count_buffer,
+                0,
+                self.batch_count,
+            );
         }
         for &(handle, vertex_count) in &skinned_draws {
             let skinned = &self.skinned[handle];
@@ -4749,6 +4812,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
+            required_features: adapter.features()
+                & (wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+                    | wgpu::Features::INDIRECT_FIRST_INSTANCE),
             ..Default::default()
         })
         .await
@@ -5165,6 +5231,65 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let hiz_downsample_pipeline = compute_pipeline(&device, HIZ_DOWNSAMPLE_SHADER);
     let (hiz_texture, hiz_storage_views, hiz_mip_views, hiz_sample_view, hiz_params, hiz_mip_count) =
         create_hiz(&device, width, height);
+    let unified_cull_pipeline = compute_pipeline(&device, MESH_CULL_UNIFIED_SHADER);
+    let build_pipeline = compute_pipeline(&device, MESH_INDIRECT_BUILD_SHADER);
+    let compact_pipeline = compute_pipeline(&device, MESH_INDIRECT_COMPACT_SHADER);
+    let batch_count = meshes.len() as u32;
+    let mut bounds_table: Vec<f32> = Vec::with_capacity(meshes.len() * 4);
+    for mesh in &meshes {
+        bounds_table.extend_from_slice(&[mesh.center.x, mesh.center.y, mesh.center.z, mesh.radius]);
+    }
+    let bounds_buffer = storage_buffer(&device, (bounds_table.len() as u64 * 4).max(4));
+    queue.write_buffer(&bounds_buffer, 0, bytemuck::cast_slice(&bounds_table));
+    let object_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 176,
+        usage: wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let visible_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (batch_count as u64 * 16).max(16),
+        usage: wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let batch_desc_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (batch_count as u64 * 16).max(16),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 4,
+        usage: wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let build_params_buffer = uniform_buffer(&device, 16);
+    queue.write_buffer(
+        &build_params_buffer,
+        0,
+        bytemuck::cast_slice(&[batch_count, 0u32, 0, 0]),
+    );
+    let compact_params_buffer = uniform_buffer(&device, 16);
+    queue.write_buffer(
+        &compact_params_buffer,
+        0,
+        bytemuck::cast_slice(&[batch_count, 0u32, 0, 0]),
+    );
+    let unified_cull_buffer = uniform_buffer(&device, 192);
     let joint_buffer = storage_buffer(&device, 64);
     add_pass(
         &mut graph,
@@ -5210,6 +5335,21 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             hiz_mip_count,
             hiz_ready: false,
             prev_view_projection: Mat4::identity(),
+            unified_cull_pipeline,
+            build_pipeline,
+            compact_pipeline,
+            object_buffer,
+            object_capacity: 1,
+            cached_objects: Vec::new(),
+            visible_indices_buffer,
+            indirect_buffer,
+            bounds_buffer,
+            batch_desc_buffer,
+            count_buffer,
+            build_params_buffer,
+            compact_params_buffer,
+            unified_cull_buffer,
+            batch_count,
             camera_buffer,
             lights_buffer,
             bind_group: geometry_bind_group,
