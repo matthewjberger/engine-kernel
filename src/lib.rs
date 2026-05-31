@@ -1405,36 +1405,6 @@ fn view_projection_matrix(world: &World, aspect_ratio: f32) -> Option<Mat4> {
     Some(camera_projection(world, aspect_ratio)? * camera_view(world)?)
 }
 
-fn mesh_instances_by_handle(world: &World, mesh_count: usize) -> Vec<Vec<(Mat4, Vec3, Material)>> {
-    let mut buckets: Vec<Vec<(Mat4, Vec3, Material)>> = vec![Vec::new(); mesh_count];
-    for table in &world.tables {
-        if table.mask & (RENDER_MESH | GLOBAL_TRANSFORM) != (RENDER_MESH | GLOBAL_TRANSFORM) {
-            continue;
-        }
-        let emissive_table = table.mask & EMISSIVE != 0;
-        let material_table = table.mask & MATERIAL != 0;
-        for row in 0..table.entities.len() {
-            let handle = table.render_meshes[row].0.0 as usize;
-            if handle >= mesh_count {
-                continue;
-            }
-            let model = table.global_transforms[row].0.0;
-            let emissive = if emissive_table {
-                table.emissives[row].0.0
-            } else {
-                Vec3::zeros()
-            };
-            let material = if material_table {
-                table.materials[row].0
-            } else {
-                Material::default()
-            };
-            buckets[handle].push((model, emissive, material));
-        }
-    }
-    buckets
-}
-
 fn skinned_instances(world: &World) -> Vec<(u32, Vec<Mat4>, Vec3, Material)> {
     let required = SKINNED_MESH | SKIN | GLOBAL_TRANSFORM;
     let mut instances = Vec::new();
@@ -1872,8 +1842,6 @@ const FILTER_ENVMAP_SHADER: &str = include_str!("shaders/filter_envmap.wgsl");
 const BRDF_LUT_SHADER: &str = include_str!("shaders/brdf_lut.wgsl");
 
 const SKIN_COMPUTE_SHADER: &str = include_str!("shaders/skin_compute.wgsl");
-
-const MESH_CULL_SHADER: &str = include_str!("shaders/mesh_cull.wgsl");
 
 const HIZ_COPY_SHADER: &str = include_str!("shaders/hiz_copy.wgsl");
 
@@ -2352,15 +2320,6 @@ fn render_graph_execute(
 struct MeshGpu {
     first_vertex: u32,
     vertex_count: u32,
-    instance_buffer: wgpu::Buffer,
-    instance_capacity: u32,
-    bounds_buffer: wgpu::Buffer,
-    cached_instances: Vec<f32>,
-    shadow_visible: Vec<wgpu::Buffer>,
-    shadow_indirect: Vec<wgpu::Buffer>,
-    shadow_cull_uniform: Vec<wgpu::Buffer>,
-    shadow_view_binds: Vec<wgpu::BindGroup>,
-    point_view_binds: Vec<wgpu::BindGroup>,
     center: Vec3,
     radius: f32,
 }
@@ -2394,7 +2353,6 @@ struct GeometryPass {
     skin_pipeline: wgpu::ComputePipeline,
     joint_buffer: wgpu::Buffer,
     joint_capacity: u32,
-    cull_pipeline: wgpu::ComputePipeline,
     mesh_vertex_buffer: wgpu::Buffer,
     hiz_copy_pipeline: wgpu::ComputePipeline,
     hiz_downsample_pipeline: wgpu::ComputePipeline,
@@ -2412,7 +2370,12 @@ struct GeometryPass {
     compact_pipeline: wgpu::ComputePipeline,
     object_buffer: wgpu::Buffer,
     object_capacity: u32,
-    cached_objects: Vec<f32>,
+    cached_object_data: Vec<f32>,
+    slot_entity: Vec<Option<Entity>>,
+    slot_handle: Vec<u32>,
+    slot_tick: Vec<u32>,
+    entity_slot: HashMap<Entity, u32>,
+    free_slots: Vec<Vec<u32>>,
     visible_indices_buffer: wgpu::Buffer,
     indirect_buffer: wgpu::Buffer,
     bounds_buffer: wgpu::Buffer,
@@ -2422,6 +2385,12 @@ struct GeometryPass {
     compact_params_buffer: wgpu::Buffer,
     unified_cull_buffer: wgpu::Buffer,
     batch_count: u32,
+    shadow_visible: Vec<wgpu::Buffer>,
+    shadow_indirect: Vec<wgpu::Buffer>,
+    shadow_count: Vec<wgpu::Buffer>,
+    shadow_cull_uniform: Vec<wgpu::Buffer>,
+    shadow_view_binds: Vec<wgpu::BindGroup>,
+    point_view_binds: Vec<wgpu::BindGroup>,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -2509,73 +2478,6 @@ fn upload_instances(
     if count > 0 {
         queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
     }
-}
-
-fn upload_instances_diff(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    buffer: &mut wgpu::Buffer,
-    capacity: &mut u32,
-    cached: &mut Vec<f32>,
-    data: &[f32],
-    count: u32,
-) {
-    if count > *capacity {
-        *capacity = count.next_power_of_two();
-        *buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: *capacity as u64 * 176,
-            usage: wgpu::BufferUsages::VERTEX
-                | wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        cached.clear();
-    }
-    if count == 0 {
-        cached.clear();
-        return;
-    }
-    if cached.len() != data.len() {
-        queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
-        cached.clear();
-        cached.extend_from_slice(data);
-        return;
-    }
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let mut changed = 0usize;
-    let mut open: Option<(usize, usize)> = None;
-    for (record, (new, old)) in data
-        .chunks_exact(44)
-        .zip(cached.chunks_exact(44))
-        .enumerate()
-    {
-        if new != old {
-            changed += 1;
-            open = Some(open.map_or((record, record + 1), |(start, _)| (start, record + 1)));
-        } else if let Some(range) = open.take() {
-            ranges.push(range);
-        }
-    }
-    if let Some(range) = open.take() {
-        ranges.push(range);
-    }
-    if ranges.is_empty() {
-        return;
-    }
-    if changed as f32 / count as f32 > 0.3 {
-        queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
-    } else {
-        for (start, end) in ranges {
-            queue.write_buffer(
-                buffer,
-                start as u64 * 176,
-                bytemuck::cast_slice(&data[start * 44..end * 44]),
-            );
-        }
-    }
-    cached.clear();
-    cached.extend_from_slice(data);
 }
 
 struct GltfNode {
@@ -3173,20 +3075,7 @@ fn write_cull_uniform(
     queue.write_buffer(buffer, 0, bytemuck::cast_slice(&data));
 }
 
-fn mesh_gpu(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    vertices: &[f32],
-    first_vertex: u32,
-) -> MeshGpu {
-    let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: 176,
-        usage: wgpu::BufferUsages::VERTEX
-            | wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+fn mesh_gpu(vertices: &[f32], first_vertex: u32) -> MeshGpu {
     let mut minimum = [f32::MAX; 3];
     let mut maximum = [f32::MIN; 3];
     for vertex in vertices.chunks_exact(11) {
@@ -3206,24 +3095,9 @@ fn mesh_gpu(
         maximum[2] - center.z,
     )
     .norm();
-    let bounds_buffer = uniform_buffer(device, 16);
-    queue.write_buffer(
-        &bounds_buffer,
-        0,
-        bytemuck::cast_slice(&[center.x, center.y, center.z, radius]),
-    );
     MeshGpu {
         first_vertex,
         vertex_count: vertices.len() as u32 / 11,
-        instance_buffer,
-        instance_capacity: 1,
-        bounds_buffer,
-        cached_instances: Vec::new(),
-        shadow_visible: Vec::new(),
-        shadow_indirect: Vec::new(),
-        shadow_cull_uniform: Vec::new(),
-        shadow_view_binds: Vec::new(),
-        point_view_binds: Vec::new(),
         center,
         radius,
     }
@@ -3295,7 +3169,6 @@ impl GeometryPass {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         bind_groups: &[wgpu::BindGroup],
-        counts: &[u32],
         skinned_draws: &[(usize, u32)],
         base: usize,
     ) {
@@ -3323,12 +3196,17 @@ impl GeometryPass {
             pass.set_scissor_rect(slot_x as u32, slot_y as u32, 1024, 1024);
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, bind_group, &[]);
-            for (handle, mesh) in self.meshes.iter().enumerate() {
-                if counts[handle] > 0 && base + slot < mesh.shadow_view_binds.len() {
-                    pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
-                    pass.set_bind_group(1, &mesh.shadow_view_binds[base + slot], &[]);
-                    pass.draw_indirect(&mesh.shadow_indirect[base + slot], 0);
-                }
+            let view_index = base + slot;
+            if view_index < self.shadow_view_binds.len() {
+                pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
+                pass.set_bind_group(1, &self.shadow_view_binds[view_index], &[]);
+                pass.multi_draw_indirect_count(
+                    &self.shadow_indirect[view_index],
+                    0,
+                    &self.shadow_count[view_index],
+                    0,
+                    self.batch_count,
+                );
             }
             for &(handle, vertex_count) in skinned_draws {
                 let skinned = &self.skinned[handle];
@@ -3539,154 +3417,174 @@ impl PassNode for GeometryPass {
         let current_view_projection = view_projection_matrix(context.world, context.aspect_ratio)
             .unwrap_or_else(Mat4::identity);
         let frustum = frustum_planes(&current_view_projection);
-        let gathered = mesh_instances_by_handle(context.world, self.meshes.len());
-        let mut counts = Vec::with_capacity(self.meshes.len());
-        let mut object_data: Vec<f32> = Vec::new();
-        let mut batch_descs: Vec<u32> = Vec::with_capacity(self.meshes.len() * 4);
-        for (handle, mesh) in self.meshes.iter_mut().enumerate() {
-            let instances = &gathered[handle];
-            let count = instances.len() as u32;
-            let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 44);
-            for (model, emissive, material) in instances {
-                data.extend_from_slice(model.as_slice());
-                data.extend_from_slice(&[0.0; 12]);
-                data.extend_from_slice(&[emissive.x, emissive.y, emissive.z, material.roughness]);
-                data.extend_from_slice(&[
-                    material.albedo.x,
-                    material.albedo.y,
-                    material.albedo.z,
-                    material.metallic,
-                ]);
-                data.push(material.base_layer as f32);
-                data.push(material.normal_layer as f32);
-                data.push(material.orm_layer as f32);
-                data.push(material.emissive_layer as f32);
-                data.extend_from_slice(&[
-                    f32::from_bits(1),
-                    f32::from_bits(handle as u32),
-                    0.0,
-                    0.0,
-                ]);
-            }
-            upload_instances_diff(
-                context.device,
-                context.queue,
-                &mut mesh.instance_buffer,
-                &mut mesh.instance_capacity,
-                &mut mesh.cached_instances,
-                &data,
-                count,
-            );
-            counts.push(count);
-            batch_descs.extend_from_slice(&[mesh.vertex_count, mesh.first_vertex, count, 0]);
-            object_data.extend_from_slice(&data);
-            if count == 0 {
+        let mesh_count = self.meshes.len();
+        let mut seen = vec![false; self.slot_entity.len()];
+        let mut live_counts = vec![0u32; mesh_count];
+        let mut dirty_slots: Vec<u32> = Vec::new();
+        for table in &context.world.tables {
+            if table.mask & (RENDER_MESH | GLOBAL_TRANSFORM) != (RENDER_MESH | GLOBAL_TRANSFORM) {
                 continue;
             }
-            let needed = mesh.instance_capacity as u64 * 4;
-            while mesh.shadow_visible.len() < shadow_vps.len() {
-                mesh.shadow_visible
-                    .push(context.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: None,
-                        size: needed,
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    }));
-                mesh.shadow_indirect
-                    .push(context.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: None,
-                        size: 16,
-                        usage: wgpu::BufferUsages::INDIRECT
-                            | wgpu::BufferUsages::STORAGE
-                            | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    }));
-                mesh.shadow_cull_uniform
-                    .push(uniform_buffer(context.device, 192));
-            }
-            mesh.shadow_view_binds.clear();
-            mesh.point_view_binds.clear();
-            for (view, shadow_vp) in shadow_vps.iter().enumerate() {
-                if mesh.shadow_visible[view].size() < needed {
-                    mesh.shadow_visible[view] =
-                        context.device.create_buffer(&wgpu::BufferDescriptor {
-                            label: None,
-                            size: needed,
-                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
-                        });
+            let emissive_table = table.mask & EMISSIVE != 0;
+            let material_table = table.mask & MATERIAL != 0;
+            for row in 0..table.entities.len() {
+                let handle = table.render_meshes[row].0.0 as usize;
+                if handle >= mesh_count {
+                    continue;
                 }
-                let view_frustum = frustum_planes(shadow_vp);
-                write_cull_uniform(
-                    context.queue,
-                    &mesh.shadow_cull_uniform[view],
-                    &view_frustum,
-                    &Mat4::identity(),
-                    (0.0, 0.0),
-                    count,
-                    self.hiz_mip_count,
-                    false,
-                );
-                context.queue.write_buffer(
-                    &mesh.shadow_indirect[view],
-                    0,
-                    bytemuck::cast_slice(&[mesh.vertex_count, 0u32, mesh.first_vertex, 0]),
-                );
-                let view_bind = bind_group(
-                    context.device,
-                    &self.cull_pipeline.get_bind_group_layout(0),
-                    vec![
-                        (0, mesh.instance_buffer.as_entire_binding()),
-                        (1, mesh.shadow_visible[view].as_entire_binding()),
-                        (2, mesh.shadow_indirect[view].as_entire_binding()),
-                        (3, mesh.bounds_buffer.as_entire_binding()),
-                        (4, mesh.shadow_cull_uniform[view].as_entire_binding()),
-                        (5, wgpu::BindingResource::TextureView(&self.hiz_sample_view)),
-                    ],
-                );
-                if view < point_view_base {
-                    mesh.shadow_view_binds.push(bind_group(
-                        context.device,
-                        &self.shadow_pipeline.get_bind_group_layout(1),
-                        vec![
-                            (0, mesh.instance_buffer.as_entire_binding()),
-                            (1, mesh.shadow_visible[view].as_entire_binding()),
-                        ],
-                    ));
+                let entity = table.entities[row];
+                let mut tick = table.global_transforms[row]
+                    .1
+                    .max(table.render_meshes[row].1);
+                if material_table {
+                    tick = tick.max(table.materials[row].1);
+                }
+                if emissive_table {
+                    tick = tick.max(table.emissives[row].1);
+                }
+                live_counts[handle] += 1;
+                let slot = if let Some(&existing) = self.entity_slot.get(&entity) {
+                    existing
                 } else {
-                    mesh.point_view_binds.push(bind_group(
-                        context.device,
-                        &self.point_pipeline.get_bind_group_layout(1),
-                        vec![
-                            (0, mesh.instance_buffer.as_entire_binding()),
-                            (1, mesh.shadow_visible[view].as_entire_binding()),
-                        ],
-                    ));
+                    let slot = if let Some(free) = self.free_slots[handle].pop() {
+                        free
+                    } else {
+                        let new_slot = self.slot_entity.len() as u32;
+                        self.slot_entity.push(None);
+                        self.slot_handle.push(handle as u32);
+                        self.slot_tick.push(0);
+                        self.cached_object_data
+                            .resize(self.cached_object_data.len() + 44, 0.0);
+                        seen.push(false);
+                        new_slot
+                    };
+                    self.slot_entity[slot as usize] = Some(entity);
+                    self.slot_handle[slot as usize] = handle as u32;
+                    self.entity_slot.insert(entity, slot);
+                    self.slot_tick[slot as usize] = u32::MAX;
+                    slot
+                };
+                seen[slot as usize] = true;
+                if self.slot_tick[slot as usize] != tick {
+                    let model = table.global_transforms[row].0.0;
+                    let emissive = if emissive_table {
+                        table.emissives[row].0.0
+                    } else {
+                        Vec3::zeros()
+                    };
+                    let material = if material_table {
+                        table.materials[row].0
+                    } else {
+                        Material::default()
+                    };
+                    let base = slot as usize * 44;
+                    let record = &mut self.cached_object_data[base..base + 44];
+                    record[..16].copy_from_slice(model.as_slice());
+                    record[16..28].copy_from_slice(&[0.0; 12]);
+                    record[28..32].copy_from_slice(&[
+                        emissive.x,
+                        emissive.y,
+                        emissive.z,
+                        material.roughness,
+                    ]);
+                    record[32..36].copy_from_slice(&[
+                        material.albedo.x,
+                        material.albedo.y,
+                        material.albedo.z,
+                        material.metallic,
+                    ]);
+                    record[36..40].copy_from_slice(&[
+                        material.base_layer as f32,
+                        material.normal_layer as f32,
+                        material.orm_layer as f32,
+                        material.emissive_layer as f32,
+                    ]);
+                    record[40..44].copy_from_slice(&[
+                        f32::from_bits(1),
+                        f32::from_bits(handle as u32),
+                        0.0,
+                        0.0,
+                    ]);
+                    self.slot_tick[slot as usize] = tick;
+                    dirty_slots.push(slot);
                 }
-                let mut view_cull =
-                    context
-                        .encoder
-                        .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: None,
-                            timestamp_writes: None,
-                        });
-                view_cull.set_pipeline(&self.cull_pipeline);
-                view_cull.set_bind_group(0, &view_bind, &[]);
-                view_cull.dispatch_workgroups(count.div_ceil(64), 1, 1);
+            }
+        }
+        for (slot, &was_seen) in seen.iter().enumerate() {
+            if !was_seen && let Some(entity) = self.slot_entity[slot].take() {
+                self.entity_slot.remove(&entity);
+                let handle = self.slot_handle[slot];
+                self.free_slots[handle as usize].push(slot as u32);
+                self.cached_object_data[slot * 44 + 40] = f32::from_bits(0);
+                dirty_slots.push(slot as u32);
             }
         }
 
-        let total_objects = (object_data.len() / 44) as u32;
-        upload_instances_diff(
-            context.device,
-            context.queue,
-            &mut self.object_buffer,
-            &mut self.object_capacity,
-            &mut self.cached_objects,
-            &object_data,
-            total_objects,
+        let total_slots = self.slot_entity.len() as u32;
+        let object_needed = (total_slots as u64 * 176).max(176);
+        if self.object_buffer.size() < object_needed {
+            self.object_capacity = total_slots.max(1).next_power_of_two();
+            self.object_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: self.object_capacity as u64 * 176,
+                usage: wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            if !self.cached_object_data.is_empty() {
+                context.queue.write_buffer(
+                    &self.object_buffer,
+                    0,
+                    bytemuck::cast_slice(&self.cached_object_data),
+                );
+            }
+        } else if !dirty_slots.is_empty() {
+            dirty_slots.sort_unstable();
+            dirty_slots.dedup();
+            let mut run_start = dirty_slots[0];
+            let mut run_end = dirty_slots[0] + 1;
+            for &slot in &dirty_slots[1..] {
+                if slot == run_end {
+                    run_end = slot + 1;
+                } else {
+                    context.queue.write_buffer(
+                        &self.object_buffer,
+                        run_start as u64 * 176,
+                        bytemuck::cast_slice(
+                            &self.cached_object_data
+                                [run_start as usize * 44..run_end as usize * 44],
+                        ),
+                    );
+                    run_start = slot;
+                    run_end = slot + 1;
+                }
+            }
+            context.queue.write_buffer(
+                &self.object_buffer,
+                run_start as u64 * 176,
+                bytemuck::cast_slice(
+                    &self.cached_object_data[run_start as usize * 44..run_end as usize * 44],
+                ),
+            );
+        }
+
+        let mut batch_descs: Vec<u32> = Vec::with_capacity(mesh_count * 4);
+        for (handle, mesh) in self.meshes.iter().enumerate() {
+            batch_descs.extend_from_slice(&[
+                mesh.vertex_count,
+                mesh.first_vertex,
+                live_counts[handle],
+                0,
+            ]);
+        }
+        context.queue.write_buffer(
+            &self.batch_desc_buffer,
+            0,
+            bytemuck::cast_slice(&batch_descs),
         );
-        let visible_needed = (total_objects as u64 * 4).max(4);
+        let total_visible: u32 = live_counts.iter().sum();
+        let visible_needed = (total_visible as u64 * 4).max(4);
         if self.visible_indices_buffer.size() < visible_needed {
             self.visible_indices_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -3695,18 +3593,13 @@ impl PassNode for GeometryPass {
                 mapped_at_creation: false,
             });
         }
-        context.queue.write_buffer(
-            &self.batch_desc_buffer,
-            0,
-            bytemuck::cast_slice(&batch_descs),
-        );
         write_cull_uniform(
             context.queue,
             &self.unified_cull_buffer,
             &frustum,
             &self.prev_view_projection,
             (context.size.0 as f32, context.size.1 as f32),
-            total_objects,
+            total_slots,
             self.hiz_mip_count,
             self.hiz_ready && context.world.resources.hiz_enabled,
         );
@@ -3761,7 +3654,7 @@ impl PassNode for GeometryPass {
                     });
             unified_cull.set_pipeline(&self.unified_cull_pipeline);
             unified_cull.set_bind_group(0, &unified_cull_bind, &[]);
-            unified_cull.dispatch_workgroups(total_objects.div_ceil(64).max(1), 1, 1);
+            unified_cull.dispatch_workgroups(total_slots.div_ceil(64).max(1), 1, 1);
         }
         {
             let mut compact = context
@@ -3773,6 +3666,141 @@ impl PassNode for GeometryPass {
             compact.set_pipeline(&self.compact_pipeline);
             compact.set_bind_group(0, &compact_bind, &[]);
             compact.dispatch_workgroups(1, 1, 1);
+        }
+
+        while self.shadow_visible.len() < shadow_vps.len() {
+            self.shadow_visible
+                .push(context.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            self.shadow_indirect
+                .push(context.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (self.batch_count as u64 * 16).max(16),
+                    usage: wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            self.shadow_count
+                .push(context.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: 4,
+                    usage: wgpu::BufferUsages::INDIRECT
+                        | wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            self.shadow_cull_uniform
+                .push(uniform_buffer(context.device, 192));
+        }
+        self.shadow_view_binds.clear();
+        self.point_view_binds.clear();
+        for (view, shadow_vp) in shadow_vps.iter().enumerate() {
+            if self.shadow_visible[view].size() < visible_needed {
+                self.shadow_visible[view] = context.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: visible_needed,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            let view_frustum = frustum_planes(shadow_vp);
+            write_cull_uniform(
+                context.queue,
+                &self.shadow_cull_uniform[view],
+                &view_frustum,
+                &Mat4::identity(),
+                (0.0, 0.0),
+                total_slots,
+                self.hiz_mip_count,
+                false,
+            );
+            let view_build_bind = bind_group(
+                context.device,
+                &self.build_pipeline.get_bind_group_layout(0),
+                vec![
+                    (0, self.shadow_indirect[view].as_entire_binding()),
+                    (1, self.batch_desc_buffer.as_entire_binding()),
+                    (2, self.build_params_buffer.as_entire_binding()),
+                ],
+            );
+            let view_cull_bind = bind_group(
+                context.device,
+                &self.unified_cull_pipeline.get_bind_group_layout(0),
+                vec![
+                    (0, self.object_buffer.as_entire_binding()),
+                    (1, self.shadow_visible[view].as_entire_binding()),
+                    (2, self.shadow_indirect[view].as_entire_binding()),
+                    (3, self.bounds_buffer.as_entire_binding()),
+                    (4, self.shadow_cull_uniform[view].as_entire_binding()),
+                    (5, wgpu::BindingResource::TextureView(&self.hiz_sample_view)),
+                ],
+            );
+            let view_compact_bind = bind_group(
+                context.device,
+                &self.compact_pipeline.get_bind_group_layout(0),
+                vec![
+                    (0, self.shadow_indirect[view].as_entire_binding()),
+                    (1, self.shadow_count[view].as_entire_binding()),
+                    (2, self.compact_params_buffer.as_entire_binding()),
+                ],
+            );
+            let view_layout = if view < point_view_base {
+                self.shadow_pipeline.get_bind_group_layout(1)
+            } else {
+                self.point_pipeline.get_bind_group_layout(1)
+            };
+            let view_draw_bind = bind_group(
+                context.device,
+                &view_layout,
+                vec![
+                    (0, self.object_buffer.as_entire_binding()),
+                    (1, self.shadow_visible[view].as_entire_binding()),
+                ],
+            );
+            if view < point_view_base {
+                self.shadow_view_binds.push(view_draw_bind);
+            } else {
+                self.point_view_binds.push(view_draw_bind);
+            }
+            {
+                let mut build = context
+                    .encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                build.set_pipeline(&self.build_pipeline);
+                build.set_bind_group(0, &view_build_bind, &[]);
+                build.dispatch_workgroups(1, 1, 1);
+            }
+            {
+                let mut cull = context
+                    .encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                cull.set_pipeline(&self.unified_cull_pipeline);
+                cull.set_bind_group(0, &view_cull_bind, &[]);
+                cull.dispatch_workgroups(total_slots.div_ceil(64).max(1), 1, 1);
+            }
+            {
+                let mut compact =
+                    context
+                        .encoder
+                        .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: None,
+                            timestamp_writes: None,
+                        });
+                compact.set_pipeline(&self.compact_pipeline);
+                compact.set_bind_group(0, &view_compact_bind, &[]);
+                compact.dispatch_workgroups(1, 1, 1);
+            }
         }
 
         let skinned = skinned_instances(context.world);
@@ -3882,7 +3910,6 @@ impl PassNode for GeometryPass {
             context.encoder,
             &self.shadow_view,
             &self.cascade_bind_groups[..4],
-            &counts,
             &skinned_draws,
             0,
         );
@@ -3890,7 +3917,6 @@ impl PassNode for GeometryPass {
             context.encoder,
             &self.spot_atlas_view,
             &self.spot_bind_groups[..spot_shadows.len()],
-            &counts,
             &skinned_draws,
             spot_view_base,
         );
@@ -3926,12 +3952,16 @@ impl PassNode for GeometryPass {
                         });
                 point_pass.set_pipeline(&self.point_pipeline);
                 point_pass.set_bind_group(0, &self.point_face_bind_groups[layer], &[]);
-                for (handle, mesh) in self.meshes.iter().enumerate() {
-                    if counts[handle] > 0 && layer < mesh.point_view_binds.len() {
-                        point_pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
-                        point_pass.set_bind_group(1, &mesh.point_view_binds[layer], &[]);
-                        point_pass.draw_indirect(&mesh.shadow_indirect[view], 0);
-                    }
+                if layer < self.point_view_binds.len() {
+                    point_pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
+                    point_pass.set_bind_group(1, &self.point_view_binds[layer], &[]);
+                    point_pass.multi_draw_indirect_count(
+                        &self.shadow_indirect[view],
+                        0,
+                        &self.shadow_count[view],
+                        0,
+                        self.batch_count,
+                    );
                 }
                 for &(skinned_handle, vertex_count) in &skinned_draws {
                     let skinned = &self.skinned[skinned_handle];
@@ -4903,7 +4933,7 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let mut meshes = Vec::with_capacity(mesh_vertices.len());
     for vertices in &mesh_vertices {
         let first_vertex = (combined_vertices.len() / 11) as u32;
-        meshes.push(mesh_gpu(&device, &queue, vertices, first_vertex));
+        meshes.push(mesh_gpu(vertices, first_vertex));
         combined_vertices.extend_from_slice(vertices);
     }
     let mesh_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -5228,7 +5258,6 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let ssr = add_color_resource(&mut graph, false, SCENE_FORMAT, wgpu::Color::BLACK);
     let ldr = add_color_resource(&mut graph, false, SCENE_FORMAT, background);
     let skin_pipeline = compute_pipeline(&device, SKIN_COMPUTE_SHADER);
-    let cull_pipeline = compute_pipeline(&device, MESH_CULL_SHADER);
     let hiz_copy_pipeline = compute_pipeline(&device, HIZ_COPY_SHADER);
     let hiz_downsample_pipeline = compute_pipeline(&device, HIZ_DOWNSAMPLE_SHADER);
     let (hiz_texture, hiz_storage_views, hiz_mip_views, hiz_sample_view, hiz_params, hiz_mip_count) =
@@ -5324,7 +5353,6 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             skin_pipeline,
             joint_buffer,
             joint_capacity: 0,
-            cull_pipeline,
             mesh_vertex_buffer,
             hiz_copy_pipeline,
             hiz_downsample_pipeline,
@@ -5342,7 +5370,12 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             compact_pipeline,
             object_buffer,
             object_capacity: 1,
-            cached_objects: Vec::new(),
+            cached_object_data: Vec::new(),
+            slot_entity: Vec::new(),
+            slot_handle: Vec::new(),
+            slot_tick: Vec::new(),
+            entity_slot: HashMap::new(),
+            free_slots: vec![Vec::new(); batch_count as usize],
             visible_indices_buffer,
             indirect_buffer,
             bounds_buffer,
@@ -5352,6 +5385,12 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             compact_params_buffer,
             unified_cull_buffer,
             batch_count,
+            shadow_visible: Vec::new(),
+            shadow_indirect: Vec::new(),
+            shadow_count: Vec::new(),
+            shadow_cull_uniform: Vec::new(),
+            shadow_view_binds: Vec::new(),
+            point_view_binds: Vec::new(),
             camera_buffer,
             lights_buffer,
             bind_group: geometry_bind_group,
