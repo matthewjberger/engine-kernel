@@ -1405,8 +1405,8 @@ fn view_projection_matrix(world: &World, aspect_ratio: f32) -> Option<Mat4> {
     Some(camera_projection(world, aspect_ratio)? * camera_view(world)?)
 }
 
-fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3, Material)> {
-    let mut instances = Vec::new();
+fn mesh_instances_by_handle(world: &World, mesh_count: usize) -> Vec<Vec<(Mat4, Vec3, Material)>> {
+    let mut buckets: Vec<Vec<(Mat4, Vec3, Material)>> = vec![Vec::new(); mesh_count];
     for table in &world.tables {
         if table.mask & (RENDER_MESH | GLOBAL_TRANSFORM) != (RENDER_MESH | GLOBAL_TRANSFORM) {
             continue;
@@ -1414,7 +1414,8 @@ fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3, Material)> {
         let emissive_table = table.mask & EMISSIVE != 0;
         let material_table = table.mask & MATERIAL != 0;
         for row in 0..table.entities.len() {
-            if table.render_meshes[row].0.0 != handle {
+            let handle = table.render_meshes[row].0.0 as usize;
+            if handle >= mesh_count {
                 continue;
             }
             let model = table.global_transforms[row].0.0;
@@ -1428,10 +1429,10 @@ fn mesh_instances(world: &World, handle: u32) -> Vec<(Mat4, Vec3, Material)> {
             } else {
                 Material::default()
             };
-            instances.push((model, emissive, material));
+            buckets[handle].push((model, emissive, material));
         }
     }
-    instances
+    buckets
 }
 
 fn skinned_instances(world: &World) -> Vec<(u32, Vec<Mat4>, Vec3, Material)> {
@@ -3538,14 +3539,15 @@ impl PassNode for GeometryPass {
         let current_view_projection = view_projection_matrix(context.world, context.aspect_ratio)
             .unwrap_or_else(Mat4::identity);
         let frustum = frustum_planes(&current_view_projection);
+        let gathered = mesh_instances_by_handle(context.world, self.meshes.len());
         let mut counts = Vec::with_capacity(self.meshes.len());
         let mut object_data: Vec<f32> = Vec::new();
         let mut batch_descs: Vec<u32> = Vec::with_capacity(self.meshes.len() * 4);
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
-            let instances = mesh_instances(context.world, handle as u32);
+            let instances = &gathered[handle];
             let count = instances.len() as u32;
             let mut data: Vec<f32> = Vec::with_capacity(instances.len() * 44);
-            for (model, emissive, material) in &instances {
+            for (model, emissive, material) in instances {
                 data.extend_from_slice(model.as_slice());
                 data.extend_from_slice(&[0.0; 12]);
                 data.extend_from_slice(&[emissive.x, emissive.y, emissive.z, material.roughness]);
