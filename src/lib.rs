@@ -536,6 +536,7 @@ struct Resources {
     commands: Vec<SpawnCommand>,
     bloom_enabled: bool,
     ssr_enabled: bool,
+    hiz_enabled: bool,
 }
 
 #[derive(Default)]
@@ -1873,6 +1874,10 @@ const SKIN_COMPUTE_SHADER: &str = include_str!("shaders/skin_compute.wgsl");
 
 const MESH_CULL_SHADER: &str = include_str!("shaders/mesh_cull.wgsl");
 
+const HIZ_COPY_SHADER: &str = include_str!("shaders/hiz_copy.wgsl");
+
+const HIZ_DOWNSAMPLE_SHADER: &str = include_str!("shaders/hiz_downsample.wgsl");
+
 const SHADER: &str = include_str!("shaders/mesh.wgsl");
 
 const SKY_SHADER: &str = include_str!("shaders/sky.wgsl");
@@ -2386,9 +2391,80 @@ struct GeometryPass {
     joint_capacity: u32,
     cull_pipeline: wgpu::ComputePipeline,
     mesh_vertex_buffer: wgpu::Buffer,
+    hiz_copy_pipeline: wgpu::ComputePipeline,
+    hiz_downsample_pipeline: wgpu::ComputePipeline,
+    hiz_texture: wgpu::Texture,
+    hiz_storage_views: Vec<wgpu::TextureView>,
+    hiz_mip_views: Vec<wgpu::TextureView>,
+    hiz_sample_view: wgpu::TextureView,
+    hiz_params: Vec<wgpu::Buffer>,
+    hiz_size: (u32, u32),
+    hiz_mip_count: u32,
+    hiz_ready: bool,
+    prev_view_projection: Mat4,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+}
+
+fn create_hiz(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (
+    wgpu::Texture,
+    Vec<wgpu::TextureView>,
+    Vec<wgpu::TextureView>,
+    wgpu::TextureView,
+    Vec<wgpu::Buffer>,
+    u32,
+) {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mip_count = (width.max(height) as f32).log2().floor() as u32 + 1;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: mip_count,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+    let mut storage_views = Vec::new();
+    let mut mip_views = Vec::new();
+    let mut params = Vec::new();
+    for mip in 0..mip_count {
+        storage_views.push(texture.create_view(&wgpu::TextureViewDescriptor {
+            base_mip_level: mip,
+            mip_level_count: Some(1),
+            ..Default::default()
+        }));
+        mip_views.push(texture.create_view(&wgpu::TextureViewDescriptor {
+            base_mip_level: mip,
+            mip_level_count: Some(1),
+            ..Default::default()
+        }));
+        let mip_width = (width >> mip).max(1);
+        let mip_height = (height >> mip).max(1);
+        let buffer = uniform_buffer(device, 16);
+        params.push(buffer);
+        let _ = (mip_width, mip_height);
+    }
+    let sample_view = texture.create_view(&Default::default());
+    (
+        texture,
+        storage_views,
+        mip_views,
+        sample_view,
+        params,
+        mip_count,
+    )
 }
 
 fn upload_instances(
@@ -3051,6 +3127,32 @@ fn frustum_planes(view_projection: &Mat4) -> [f32; 24] {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_cull_uniform(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    frustum: &[f32; 24],
+    prev_view_projection: &Mat4,
+    screen: (f32, f32),
+    count: u32,
+    hiz_mip_count: u32,
+    occlusion_enabled: bool,
+) {
+    let mut data = [0u32; 48];
+    for (index, value) in frustum.iter().enumerate() {
+        data[index] = value.to_bits();
+    }
+    for (index, value) in prev_view_projection.as_slice().iter().enumerate() {
+        data[24 + index] = value.to_bits();
+    }
+    data[40] = screen.0.to_bits();
+    data[41] = screen.1.to_bits();
+    data[42] = count;
+    data[43] = hiz_mip_count;
+    data[44] = u32::from(occlusion_enabled);
+    queue.write_buffer(buffer, 0, bytemuck::cast_slice(&data));
+}
+
 fn mesh_gpu(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -3104,7 +3206,7 @@ fn mesh_gpu(
         0,
         bytemuck::cast_slice(&[center.x, center.y, center.z, radius]),
     );
-    let cull_buffer = uniform_buffer(device, 112);
+    let cull_buffer = uniform_buffer(device, 192);
     MeshGpu {
         first_vertex,
         vertex_count: vertices.len() as u32 / 11,
@@ -3432,10 +3534,9 @@ impl PassNode for GeometryPass {
             compute.dispatch_workgroups(4, 3, 6);
         }
 
-        let frustum = frustum_planes(
-            &view_projection_matrix(context.world, context.aspect_ratio)
-                .unwrap_or_else(Mat4::identity),
-        );
+        let current_view_projection = view_projection_matrix(context.world, context.aspect_ratio)
+            .unwrap_or_else(Mat4::identity);
+        let frustum = frustum_planes(&current_view_projection);
         let mut counts = Vec::with_capacity(self.meshes.len());
         for (handle, mesh) in self.meshes.iter_mut().enumerate() {
             let instances = mesh_instances(context.world, handle as u32);
@@ -3485,14 +3586,16 @@ impl PassNode for GeometryPass {
                 0,
                 bytemuck::cast_slice(&[mesh.vertex_count, 0u32, mesh.first_vertex, 0]),
             );
-            let mut cull_data = [0u32; 28];
-            for (index, value) in frustum.iter().enumerate() {
-                cull_data[index] = value.to_bits();
-            }
-            cull_data[24] = count;
-            context
-                .queue
-                .write_buffer(&mesh.cull_buffer, 0, bytemuck::cast_slice(&cull_data));
+            write_cull_uniform(
+                context.queue,
+                &mesh.cull_buffer,
+                &frustum,
+                &self.prev_view_projection,
+                (context.size.0 as f32, context.size.1 as f32),
+                count,
+                self.hiz_mip_count,
+                self.hiz_ready && context.world.resources.hiz_enabled,
+            );
             let cull_bind = bind_group(
                 context.device,
                 &self.cull_pipeline.get_bind_group_layout(0),
@@ -3502,6 +3605,7 @@ impl PassNode for GeometryPass {
                     (2, mesh.indirect_buffer.as_entire_binding()),
                     (3, mesh.bounds_buffer.as_entire_binding()),
                     (4, mesh.cull_buffer.as_entire_binding()),
+                    (5, wgpu::BindingResource::TextureView(&self.hiz_sample_view)),
                 ],
             );
             mesh.objects_bind_group = Some(bind_group(
@@ -3540,7 +3644,7 @@ impl PassNode for GeometryPass {
                         mapped_at_creation: false,
                     }));
                 mesh.shadow_cull_uniform
-                    .push(uniform_buffer(context.device, 112));
+                    .push(uniform_buffer(context.device, 192));
             }
             mesh.shadow_view_binds.clear();
             mesh.point_view_binds.clear();
@@ -3555,15 +3659,15 @@ impl PassNode for GeometryPass {
                         });
                 }
                 let view_frustum = frustum_planes(&shadow_vps[view]);
-                let mut view_cull_data = [0u32; 28];
-                for (slot, value) in view_frustum.iter().enumerate() {
-                    view_cull_data[slot] = value.to_bits();
-                }
-                view_cull_data[24] = count;
-                context.queue.write_buffer(
+                write_cull_uniform(
+                    context.queue,
                     &mesh.shadow_cull_uniform[view],
-                    0,
-                    bytemuck::cast_slice(&view_cull_data),
+                    &view_frustum,
+                    &Mat4::identity(),
+                    (0.0, 0.0),
+                    count,
+                    self.hiz_mip_count,
+                    false,
                 );
                 context.queue.write_buffer(
                     &mesh.shadow_indirect[view],
@@ -3579,6 +3683,7 @@ impl PassNode for GeometryPass {
                         (2, mesh.shadow_indirect[view].as_entire_binding()),
                         (3, mesh.bounds_buffer.as_entire_binding()),
                         (4, mesh.shadow_cull_uniform[view].as_entire_binding()),
+                        (5, wgpu::BindingResource::TextureView(&self.hiz_sample_view)),
                     ],
                 );
                 if view < point_view_base {
@@ -3842,6 +3947,82 @@ impl PassNode for GeometryPass {
                 pass.draw(0..vertex_count, 0..1);
             }
         }
+        drop(pass);
+
+        if self.hiz_size != context.size {
+            let (texture, storage_views, mip_views, sample_view, params, mip_count) =
+                create_hiz(context.device, context.size.0, context.size.1);
+            self.hiz_texture = texture;
+            self.hiz_storage_views = storage_views;
+            self.hiz_mip_views = mip_views;
+            self.hiz_sample_view = sample_view;
+            self.hiz_params = params;
+            self.hiz_mip_count = mip_count;
+            self.hiz_size = context.size;
+        }
+        let depth_view = read_view(context, "depth");
+        for mip in 0..self.hiz_mip_count as usize {
+            let mip_width = (self.hiz_size.0 >> mip).max(1);
+            let mip_height = (self.hiz_size.1 >> mip).max(1);
+            context.queue.write_buffer(
+                &self.hiz_params[mip],
+                0,
+                bytemuck::cast_slice(&[mip_width, mip_height, 0u32, 0u32]),
+            );
+        }
+        let copy_bind = bind_group(
+            context.device,
+            &self.hiz_copy_pipeline.get_bind_group_layout(0),
+            vec![
+                (0, wgpu::BindingResource::TextureView(depth_view)),
+                (
+                    1,
+                    wgpu::BindingResource::TextureView(&self.hiz_storage_views[0]),
+                ),
+                (2, self.hiz_params[0].as_entire_binding()),
+            ],
+        );
+        {
+            let mut copy = context
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+            copy.set_pipeline(&self.hiz_copy_pipeline);
+            copy.set_bind_group(0, &copy_bind, &[]);
+            copy.dispatch_workgroups(self.hiz_size.0.div_ceil(8), self.hiz_size.1.div_ceil(8), 1);
+        }
+        for mip in 1..self.hiz_mip_count as usize {
+            let mip_width = (self.hiz_size.0 >> mip).max(1);
+            let mip_height = (self.hiz_size.1 >> mip).max(1);
+            let down_bind = bind_group(
+                context.device,
+                &self.hiz_downsample_pipeline.get_bind_group_layout(0),
+                vec![
+                    (
+                        0,
+                        wgpu::BindingResource::TextureView(&self.hiz_mip_views[mip - 1]),
+                    ),
+                    (
+                        1,
+                        wgpu::BindingResource::TextureView(&self.hiz_storage_views[mip]),
+                    ),
+                    (2, self.hiz_params[mip].as_entire_binding()),
+                ],
+            );
+            let mut down = context
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+            down.set_pipeline(&self.hiz_downsample_pipeline);
+            down.set_bind_group(0, &down_bind, &[]);
+            down.dispatch_workgroups(mip_width.div_ceil(8), mip_height.div_ceil(8), 1);
+        }
+        self.hiz_ready = true;
+        self.prev_view_projection = current_view_projection;
     }
 }
 
@@ -4980,6 +5161,10 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
     let ldr = add_color_resource(&mut graph, false, SCENE_FORMAT, background);
     let skin_pipeline = compute_pipeline(&device, SKIN_COMPUTE_SHADER);
     let cull_pipeline = compute_pipeline(&device, MESH_CULL_SHADER);
+    let hiz_copy_pipeline = compute_pipeline(&device, HIZ_COPY_SHADER);
+    let hiz_downsample_pipeline = compute_pipeline(&device, HIZ_DOWNSAMPLE_SHADER);
+    let (hiz_texture, hiz_storage_views, hiz_mip_views, hiz_sample_view, hiz_params, hiz_mip_count) =
+        create_hiz(&device, width, height);
     let joint_buffer = storage_buffer(&device, 64);
     add_pass(
         &mut graph,
@@ -5014,6 +5199,17 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             joint_capacity: 0,
             cull_pipeline,
             mesh_vertex_buffer,
+            hiz_copy_pipeline,
+            hiz_downsample_pipeline,
+            hiz_texture,
+            hiz_storage_views,
+            hiz_mip_views,
+            hiz_sample_view,
+            hiz_params,
+            hiz_size: (width, height),
+            hiz_mip_count,
+            hiz_ready: false,
+            prev_view_projection: Mat4::identity(),
             camera_buffer,
             lights_buffer,
             bind_group: geometry_bind_group,
@@ -5272,6 +5468,7 @@ fn render(graphics: &mut Graphics, world: &mut World) {
 
     let mut bloom_enabled = world.resources.bloom_enabled;
     let mut ssr_enabled = world.resources.ssr_enabled;
+    let mut hiz_enabled = world.resources.hiz_enabled;
     let egui_output = graphics.egui_state.egui_ctx().run_ui(egui_input, |ui| {
         egui::Window::new("engine").show(ui.ctx(), |ui| {
             ui.label("Spinning triangles + emissive cube");
@@ -5281,11 +5478,13 @@ fn render(graphics: &mut Graphics, world: &mut World) {
             ));
             ui.checkbox(&mut bloom_enabled, "bloom");
             ui.checkbox(&mut ssr_enabled, "ssr");
+            ui.checkbox(&mut hiz_enabled, "hi-z occlusion");
             ui.label("drag-left orbit, drag-right pan, scroll zoom");
         });
     });
     world.resources.bloom_enabled = bloom_enabled;
     world.resources.ssr_enabled = ssr_enabled;
+    world.resources.hiz_enabled = hiz_enabled;
     graphics
         .egui_state
         .handle_platform_output(&graphics.window, egui_output.platform_output);
