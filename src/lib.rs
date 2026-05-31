@@ -537,6 +537,7 @@ struct Resources {
     bloom_enabled: bool,
     ssr_enabled: bool,
     hiz_enabled: bool,
+    bindless_enabled: bool,
 }
 
 #[derive(Default)]
@@ -2394,6 +2395,9 @@ struct GeometryPass {
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    bindless_pipeline: Option<wgpu::RenderPipeline>,
+    bindless_bind_group: Option<wgpu::BindGroup>,
+    bindless_group1_layout: Option<wgpu::BindGroupLayout>,
 }
 
 fn create_hiz(
@@ -3974,9 +3978,18 @@ impl PassNode for GeometryPass {
             }
         }
 
+        let use_bindless =
+            context.world.resources.bindless_enabled && self.bindless_pipeline.is_some();
+        let array_group1_layout;
+        let group1_layout = if use_bindless {
+            self.bindless_group1_layout.as_ref().unwrap()
+        } else {
+            array_group1_layout = self.pipeline.get_bind_group_layout(1);
+            &array_group1_layout
+        };
         let unified_objects_bind = bind_group(
             context.device,
-            &self.pipeline.get_bind_group_layout(1),
+            group1_layout,
             vec![
                 (0, self.object_buffer.as_entire_binding()),
                 (1, self.visible_indices_buffer.as_entire_binding()),
@@ -4021,8 +4034,13 @@ impl PassNode for GeometryPass {
         pass.set_pipeline(&self.sky_pipeline);
         pass.set_bind_group(0, &self.sky_bind_group, &[]);
         pass.draw(0..3, 0..1);
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
+        if use_bindless {
+            pass.set_pipeline(self.bindless_pipeline.as_ref().unwrap());
+            pass.set_bind_group(0, self.bindless_bind_group.as_ref().unwrap(), &[]);
+        } else {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+        }
         if self.batch_count > 0 {
             pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
             pass.set_bind_group(1, &unified_objects_bind, &[]);
@@ -4463,6 +4481,42 @@ fn render_pipeline(
     })
 }
 
+fn render_pipeline_with_layout(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    module: &wgpu::ShaderModule,
+    buffers: &[wgpu::VertexBufferLayout],
+    targets: &[Option<wgpu::ColorTargetState>],
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers,
+        },
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets,
+        }),
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Greater),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 const TEXTURE_SIZE: usize = 512;
 const TEXTURE_LAYERS: usize = 6;
 const TEXTURE_CELL: usize = TEXTURE_SIZE / 8;
@@ -4559,6 +4613,129 @@ fn texture_array(
     texture.create_view(&wgpu::TextureViewDescriptor {
         dimension: Some(wgpu::TextureViewDimension::D2Array),
         ..Default::default()
+    })
+}
+
+fn texture_views(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    fill: impl Fn(usize, usize, usize) -> [u8; 4],
+) -> Vec<wgpu::TextureView> {
+    let size = TEXTURE_SIZE;
+    (0..TEXTURE_LAYERS)
+        .map(|layer| {
+            let mut pixels = vec![0u8; size * size * 4];
+            for y in 0..size {
+                for x in 0..size {
+                    let index = (y * size + x) * 4;
+                    pixels[index..index + 4].copy_from_slice(&fill(layer, x, y));
+                }
+            }
+            let extent = wgpu::Extent3d {
+                width: size as u32,
+                height: size as u32,
+                depth_or_array_layers: 1,
+            };
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size as u32 * 4),
+                    rows_per_image: Some(size as u32),
+                },
+                extent,
+            );
+            texture.create_view(&Default::default())
+        })
+        .collect()
+}
+
+fn bindless_geometry_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let stage = wgpu::ShaderStages::VERTEX_FRAGMENT;
+    let buffer = |binding: u32, read_only: Option<bool>| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: stage,
+        ty: wgpu::BindingType::Buffer {
+            ty: match read_only {
+                Some(read_only) => wgpu::BufferBindingType::Storage { read_only },
+                None => wgpu::BufferBindingType::Uniform,
+            },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let depth_texture = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: stage,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let sampler = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: stage,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    };
+    let texture = |binding: u32, view_dimension: wgpu::TextureViewDimension, count: Option<u32>| {
+        wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: stage,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension,
+                multisampled: false,
+            },
+            count: count.and_then(std::num::NonZeroU32::new),
+        }
+    };
+    let layers = Some(TEXTURE_LAYERS as u32);
+    let entries = [
+        buffer(0, None),
+        buffer(1, None),
+        depth_texture(2),
+        sampler(3),
+        buffer(4, None),
+        depth_texture(5),
+        buffer(6, None),
+        buffer(7, None),
+        buffer(8, Some(true)),
+        buffer(9, Some(true)),
+        texture(10, wgpu::TextureViewDimension::D2, layers),
+        sampler(11),
+        texture(12, wgpu::TextureViewDimension::Cube, None),
+        texture(13, wgpu::TextureViewDimension::Cube, None),
+        texture(14, wgpu::TextureViewDimension::D2, None),
+        sampler(15),
+        texture(16, wgpu::TextureViewDimension::D2, layers),
+        texture(17, wgpu::TextureViewDimension::D2, layers),
+        texture(18, wgpu::TextureViewDimension::D2, layers),
+        texture(19, wgpu::TextureViewDimension::CubeArray, None),
+    ];
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &entries,
     })
 }
 
@@ -4841,12 +5018,22 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
         })
         .await
         .unwrap();
+    let bindless_features = wgpu::Features::TEXTURE_BINDING_ARRAY
+        | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
+        | wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY;
+    let bindless_supported = adapter.features().contains(bindless_features)
+        && adapter.limits().max_binding_array_elements_per_shader_stage >= TEXTURE_LAYERS as u32;
+    let mut required_features = adapter.features()
+        & (wgpu::Features::MULTI_DRAW_INDIRECT_COUNT | wgpu::Features::INDIRECT_FIRST_INSTANCE);
+    let mut required_limits = wgpu::Limits::default().using_resolution(adapter.limits());
+    if bindless_supported {
+        required_features |= bindless_features;
+        required_limits.max_binding_array_elements_per_shader_stage = TEXTURE_LAYERS as u32;
+    }
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
-            required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
-            required_features: adapter.features()
-                & (wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
-                    | wgpu::Features::INDIRECT_FIRST_INSTANCE),
+            required_limits,
+            required_features,
             ..Default::default()
         })
         .await
@@ -5024,6 +5211,49 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             _ => emissive_pixel(layer, x, y),
         },
     );
+    let bindless_views = bindless_supported.then(|| {
+        let albedo = texture_views(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            |layer, x, y| match (&helmet, &character, layer) {
+                (Some(mesh), _, 4) => helmet_layer(&mesh.base_color, x, y, [255, 255, 255, 255]),
+                (_, Some(mesh), 5) => helmet_layer(&mesh.base_color, x, y, [255, 255, 255, 255]),
+                _ => albedo_pixel(layer, x, y),
+            },
+        );
+        let normal = texture_views(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            |layer, x, y| match (&helmet, &character, layer) {
+                (Some(mesh), _, 4) => helmet_layer(&mesh.normal, x, y, [128, 128, 255, 255]),
+                (_, Some(mesh), 5) => helmet_layer(&mesh.normal, x, y, [128, 128, 255, 255]),
+                _ => normal_pixel(layer, x, y),
+            },
+        );
+        let orm = texture_views(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            |layer, x, y| match (&helmet, &character, layer) {
+                (Some(mesh), _, 4) => helmet_layer(&mesh.orm, x, y, [255, 255, 255, 255]),
+                (_, Some(mesh), 5) => helmet_layer(&mesh.orm, x, y, [255, 255, 255, 255]),
+                _ => orm_pixel(layer, x, y),
+            },
+        );
+        let emissive = texture_views(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            |layer, x, y| match (&helmet, &character, layer) {
+                (Some(mesh), _, 4) => helmet_layer(&mesh.emissive, x, y, [0, 0, 0, 255]),
+                (_, Some(mesh), 5) => helmet_layer(&mesh.emissive, x, y, [0, 0, 0, 255]),
+                _ => emissive_pixel(layer, x, y),
+            },
+        );
+        [albedo, normal, orm, emissive]
+    });
     let gltf_scene = helmet.map(|import| GltfScene {
         nodes: import.nodes,
         material: Material {
@@ -5154,6 +5384,103 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             (19, wgpu::BindingResource::TextureView(&point_cube_view)),
         ],
     );
+    let bindless = bindless_views.map(|[albedo, normal, orm, emissive]| {
+        let bindless_source = SHADER
+            .replace("texture_2d_array<f32>", "binding_array<texture_2d<f32>>")
+            .replace(
+                "textureSample(albedo_textures, albedo_sampler, in.uv, in.base_layer)",
+                "textureSample(albedo_textures[in.base_layer], albedo_sampler, in.uv)",
+            )
+            .replace(
+                "textureSample(normal_textures, albedo_sampler, in.uv, in.normal_layer)",
+                "textureSample(normal_textures[in.normal_layer], albedo_sampler, in.uv)",
+            )
+            .replace(
+                "textureSample(orm_textures, albedo_sampler, in.uv, in.orm_layer)",
+                "textureSample(orm_textures[in.orm_layer], albedo_sampler, in.uv)",
+            )
+            .replace(
+                "textureSample(emissive_textures, albedo_sampler, in.uv, in.emissive_layer)",
+                "textureSample(emissive_textures[in.emissive_layer], albedo_sampler, in.uv)",
+            );
+        let bindless_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(bindless_source.into()),
+        });
+        let group0_layout = bindless_geometry_layout(&device);
+        let group1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&group0_layout), Some(&group1_layout)],
+            immediate_size: 0,
+        });
+        let bindless_pipeline = render_pipeline_with_layout(
+            &device,
+            &pipeline_layout,
+            &bindless_module,
+            &mesh_color_buffers,
+            &[Some(SCENE_FORMAT.into()), Some(SCENE_FORMAT.into())],
+        );
+        let albedo_refs: Vec<&wgpu::TextureView> = albedo.iter().collect();
+        let normal_refs: Vec<&wgpu::TextureView> = normal.iter().collect();
+        let orm_refs: Vec<&wgpu::TextureView> = orm.iter().collect();
+        let emissive_refs: Vec<&wgpu::TextureView> = emissive.iter().collect();
+        let bindless_geometry_bind_group = bind_group(
+            &device,
+            &group0_layout,
+            vec![
+                (0, camera_buffer.as_entire_binding()),
+                (1, lights_buffer.as_entire_binding()),
+                (2, wgpu::BindingResource::TextureView(&shadow_view)),
+                (3, wgpu::BindingResource::Sampler(&shadow_sampler)),
+                (4, shadow_buffer.as_entire_binding()),
+                (5, wgpu::BindingResource::TextureView(&spot_atlas_view)),
+                (6, spot_shadow_buffer.as_entire_binding()),
+                (7, cluster_uniform_buffer.as_entire_binding()),
+                (8, light_grid_buffer.as_entire_binding()),
+                (9, light_indices_buffer.as_entire_binding()),
+                (10, wgpu::BindingResource::TextureViewArray(&albedo_refs)),
+                (11, wgpu::BindingResource::Sampler(&texture_sampler)),
+                (12, wgpu::BindingResource::TextureView(&irradiance_view)),
+                (13, wgpu::BindingResource::TextureView(&prefiltered_view)),
+                (14, wgpu::BindingResource::TextureView(&brdf_view)),
+                (15, wgpu::BindingResource::Sampler(&ibl_sampler)),
+                (16, wgpu::BindingResource::TextureViewArray(&normal_refs)),
+                (17, wgpu::BindingResource::TextureViewArray(&orm_refs)),
+                (18, wgpu::BindingResource::TextureViewArray(&emissive_refs)),
+                (19, wgpu::BindingResource::TextureView(&point_cube_view)),
+            ],
+        );
+        (
+            bindless_pipeline,
+            bindless_geometry_bind_group,
+            group1_layout,
+        )
+    });
     let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(SKY_SHADER.into()),
@@ -5394,6 +5721,9 @@ async fn init_graphics(window: Arc<Window>, width: u32, height: u32) -> Graphics
             camera_buffer,
             lights_buffer,
             bind_group: geometry_bind_group,
+            bindless_pipeline: bindless.as_ref().map(|(pipeline, _, _)| pipeline.clone()),
+            bindless_bind_group: bindless.as_ref().map(|(_, group, _)| group.clone()),
+            bindless_group1_layout: bindless.map(|(_, _, layout)| layout),
         }),
         &[("color", scene), ("normals", normals), ("depth", depth)],
     );
@@ -5650,6 +5980,7 @@ fn render(graphics: &mut Graphics, world: &mut World) {
     let mut bloom_enabled = world.resources.bloom_enabled;
     let mut ssr_enabled = world.resources.ssr_enabled;
     let mut hiz_enabled = world.resources.hiz_enabled;
+    let mut bindless_enabled = world.resources.bindless_enabled;
     let egui_output = graphics.egui_state.egui_ctx().run_ui(egui_input, |ui| {
         egui::Window::new("engine").show(ui.ctx(), |ui| {
             ui.label("Spinning triangles + emissive cube");
@@ -5660,12 +5991,14 @@ fn render(graphics: &mut Graphics, world: &mut World) {
             ui.checkbox(&mut bloom_enabled, "bloom");
             ui.checkbox(&mut ssr_enabled, "ssr");
             ui.checkbox(&mut hiz_enabled, "hi-z occlusion");
+            ui.checkbox(&mut bindless_enabled, "native bindless");
             ui.label("drag-left orbit, drag-right pan, scroll zoom");
         });
     });
     world.resources.bloom_enabled = bloom_enabled;
     world.resources.ssr_enabled = ssr_enabled;
     world.resources.hiz_enabled = hiz_enabled;
+    world.resources.bindless_enabled = bindless_enabled;
     graphics
         .egui_state
         .handle_platform_output(&graphics.window, egui_output.platform_output);
